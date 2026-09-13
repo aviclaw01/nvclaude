@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-nvclaude — run Claude Code on any free model from build.nvidia.com.
+nvclaude - run Claude Code on any free model from build.nvidia.com.
 
-One file, no dependencies (Python 3.8+). It:
+One file, no dependencies (Python 3.9+). It:
   1. installs Claude Code if missing
   2. asks once for your NVIDIA API key (build.nvidia.com/settings/api-keys)
   3. lets you pick any chat model from build.nvidia.com (or --model)

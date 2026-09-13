@@ -1,6 +1,8 @@
 # nvclaude
 
-Run **Claude Code** on any free model from [build.nvidia.com](https://build.nvidia.com/models). One file, no dependencies.
+[![CI](https://github.com/aviclaw01/nvclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/aviclaw01/nvclaude/actions/workflows/ci.yml)
+
+Run **Claude Code** on any free model from [build.nvidia.com](https://build.nvidia.com/models). One file, no dependencies (Python 3.9+).
 
 ## Install (once)
 

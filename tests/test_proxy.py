@@ -42,7 +42,7 @@ class ProxyTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.mock.shutdown(); cls.proxy.shutdown()
+        cls.mock.shutdown(); cls.mock.server_close(); cls.proxy.shutdown(); cls.proxy.server_close()
 
     def test_models_are_prefixed_for_discovery(self):
         data = json.load(urllib.request.urlopen(urllib.request.Request(PROXY + "/v1/models?limit=1000", headers={"x-api-key": TOKEN})))["data"]

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m py_compile nvclaude.py tests/mock_openai.py tests/test_proxy.py
+      - run: python -m unittest discover -s tests -v
+
+  install-unix:
+    name: install.sh (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck -S warning install.sh
+      - name: install into a throwaway HOME and run the installed command
+        run: |
+          export HOME="$(mktemp -d)"; touch "$HOME/.bashrc"
+          NVCLAUDE_SRC="$PWD/nvclaude.py" bash install.sh help
+          test -x "$HOME/.local/bin/nvclaude"
+          grep -q nvclaude "$HOME/.bashrc"
+          env -i HOME="$HOME" PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/local/bin" bash -lc 'nvclaude help | grep -q "nvclaude pick"'
+          env -i HOME="$HOME" PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/local/bin" bash -lc 'nvclaude info nvidia/nemotron-3-super-120b-a12b | grep -q "262,144"'
+
+  install-windows:
+    name: install.ps1 (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Error
+          if ($r) { $r | Format-Table; exit 1 }
+      - name: install into a throwaway LOCALAPPDATA and run the installed command
+        shell: pwsh
+        run: |
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "lad"; New-Item -ItemType Directory -Force $env:LOCALAPPDATA | Out-Null
+          $env:NVCLAUDE_SRC = (Resolve-Path nvclaude.py).Path
+          & .\install.ps1 help
+          if ($LASTEXITCODE -ne 0) { throw "installer exited $LASTEXITCODE" }
+          $dir = Join-Path $env:LOCALAPPDATA "nvclaude"
+          if (-not (Test-Path (Join-Path $dir "nvclaude.cmd"))) { throw "shim missing" }
+          if (-not (Test-Path (Join-Path $dir "nvclaude.py")))  { throw "script missing" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($userPath -notlike "*$dir*") { throw "user PATH not updated: $userPath" }
+          $out = & (Join-Path $dir "nvclaude.cmd") info nvidia/nemotron-3-super-120b-a12b
+          if (($out -join " ") -notmatch "262,144") { throw "installed command failed: $out" }

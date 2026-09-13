@@ -26,7 +26,7 @@ nvclaude ultra        Nemotron 3 Ultra   (also: nano | super | lightning)
 nvclaude list         print the catalog
 nvclaude info [model] context window, output cap, vision
 nvclaude key          change the API key
-nvclaude serve        proxy only, for VS Code or other clients
+nvclaude serve        proxy only, for VS Code or other clients (prints the token to use as ANTHROPIC_AUTH_TOKEN)
 nvclaude -- --continue   pass args through to claude
 ```
 
@@ -46,7 +46,10 @@ placeholder instead. Claude Code is told each model's real context window so aut
 Reasoning effort picked in `/model` is sent as `reasoning_effort`; JSON-schema outputs become `response_format`. When a model
 rejects a parameter or a tool schema, the proxy retries with it dropped or simplified and remembers that for the session.
 
-Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_MAX_TOKENS` (default 32768), `NVCLAUDE_PING_SECS` (default 15), `NVCLAUDE_DEBUG=1`
+The proxy only accepts requests carrying a per-session token, so other processes on the machine cannot spend your key;
+running `nvclaude` twice reuses the proxy that is already up.
+
+Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_TOKEN` (pin the proxy token, e.g. for `serve`), `NVCLAUDE_MAX_TOKENS` (default 32768), `NVCLAUDE_PING_SECS` (default 15), `NVCLAUDE_DEBUG=1`
 (request/latency log), `NVCLAUDE_DUMP=<file>` (append every raw Anthropic request, for debugging).
 
 ## What the launcher sets

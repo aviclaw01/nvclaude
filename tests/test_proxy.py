@@ -14,11 +14,12 @@ import importlib.util  # noqa: E402
 spec = importlib.util.spec_from_file_location("nvclaude", os.path.join(os.path.dirname(HERE), "nvclaude.py"))
 nv = importlib.util.module_from_spec(spec); spec.loader.exec_module(nv)
 PROXY = "http://127.0.0.1:8797"
+TOKEN = "test-proxy-token"
 
 
-def post(path, body, stream=False):
+def post(path, body, stream=False, token=TOKEN):
     req = urllib.request.Request(PROXY + path, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
     r = urllib.request.urlopen(req, timeout=10)
     return r if stream else json.load(r)
 
@@ -37,14 +38,14 @@ class ProxyTests(unittest.TestCase):
         cls.mock = ThreadingHTTPServer(("127.0.0.1", 8799), mock_openai.H)
         threading.Thread(target=cls.mock.serve_forever, daemon=True).start()
         nv.STATE.update(api_key="test", model="nvidia/nemotron-3-super-120b-a12b")
-        cls.proxy = nv.serve(8797)
+        cls.proxy = nv.serve(8797, TOKEN)
 
     @classmethod
     def tearDownClass(cls):
         cls.mock.shutdown(); cls.proxy.shutdown()
 
     def test_models_are_prefixed_for_discovery(self):
-        data = json.load(urllib.request.urlopen(PROXY + "/v1/models?limit=1000"))["data"]
+        data = json.load(urllib.request.urlopen(urllib.request.Request(PROXY + "/v1/models?limit=1000", headers={"x-api-key": TOKEN})))["data"]
         ids = [m["id"] for m in data]
         self.assertTrue(all(i.startswith(nv.PREFIX) for i in ids))
         self.assertNotIn(nv.PREFIX + "nvidia/nemotron-3-embed-1b", ids)  # non-chat models filtered
@@ -124,7 +125,7 @@ class ProxyTests(unittest.TestCase):
 
     def test_truncated_400_error_body_gets_a_json_error_not_a_dropped_socket(self):   # issue #17
         req = urllib.request.Request(PROXY + "/v1/messages", data=json.dumps({"model": nv.PREFIX + "fail/400-truncated", "max_tokens": 5,
-                                     "messages": [{"role": "user", "content": "hi"}]}).encode(), method="POST", headers={"Content-Type": "application/json"})
+                                     "messages": [{"role": "user", "content": "hi"}]}).encode(), method="POST", headers={"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN})
         with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req, timeout=10)
         self.assertEqual(cm.exception.code, 400)
         body = json.load(cm.exception)
@@ -251,7 +252,7 @@ class ProxyTests(unittest.TestCase):
 
     def test_context_overflow_wording_triggers_compaction(self):    # #2 remainder
         req = urllib.request.Request(PROXY + "/v1/messages", data=json.dumps({"model": nv.PREFIX + "fail/context", "max_tokens": 5,
-                                     "messages": [{"role": "user", "content": "hi"}]}).encode(), method="POST", headers={"Content-Type": "application/json"})
+                                     "messages": [{"role": "user", "content": "hi"}]}).encode(), method="POST", headers={"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN})
         with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req, timeout=10)
         body = json.load(cm.exception)
         self.assertEqual(body["error"]["type"], "invalid_request_error"); self.assertTrue(body["error"]["message"].startswith("prompt is too long"))
@@ -266,6 +267,26 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144"); self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], str(int(262_144 * 0.9)))
         post("/v1/messages", {"model": nv.PREFIX + "meta/llama-3.2-11b-vision-instruct", "max_tokens": 100_000, "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(mock_openai.LAST["req"]["max_tokens"], 131_072 // 4)   # capped to a quarter of the window
+
+    def test_proxy_requires_session_token(self):             # #11
+        with self.assertRaises(urllib.error.HTTPError) as cm: post("/v1/messages", {"model": "x", "max_tokens": 1, "messages": []}, token="wrong")
+        self.assertEqual(cm.exception.code, 401); self.assertEqual(json.load(cm.exception)["error"]["type"], "authentication_error")
+        with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(PROXY + "/v1/models", timeout=5)
+        self.assertEqual(cm.exception.code, 401)
+        self.assertEqual(urllib.request.urlopen(urllib.request.Request(PROXY + "/api/hello", method="HEAD"), timeout=5).status, 200)   # probe stays open
+        self.assertTrue(json.load(urllib.request.urlopen(PROXY + "/nvclaude", timeout=5))["nvclaude"])                             # identity probe
+        self.assertEqual(post("/v1/messages/count_tokens", {"messages": []}, token=TOKEN)["input_tokens"] >= 1, True)
+
+    def test_running_instance_detection(self):
+        import tempfile
+        old = nv.RUNFILE
+        try:
+            nv.RUNFILE = os.path.join(tempfile.mkdtemp(), "run.json")
+            self.assertIsNone(nv.running_instance(8797))                                       # no run file -> not reusable
+            json.dump({"pid": 1, "port": 8797, "token": TOKEN, "model": "m"}, open(nv.RUNFILE, "w"))
+            self.assertEqual(nv.running_instance(8797)["token"], TOKEN)
+            self.assertIsNone(nv.running_instance(8799))                                       # the mock upstream is not nvclaude
+        finally: nv.RUNFILE = old
 
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]

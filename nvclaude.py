@@ -22,14 +22,15 @@ Usage:
 Inside Claude Code, /model lists every NVIDIA model too (gateway discovery).
 Config lives in ~/.nvclaude.json (chmod 600).
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, threading, time, urllib.request, urllib.error
+import argparse, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = os.environ.get("NVCLAUDE_UPSTREAM", "https://integrate.api.nvidia.com/v1")
 CONFIG = os.path.join(os.path.expanduser("~"), ".nvclaude.json")
 PREFIX = "nvclaude/"          # exposed model ids must contain "claude" for Claude Code's /model discovery
 SKIP = re.compile(r"embed|rerank|reward|safety|guard|ocr|parse|whisper|parakeet|riva|-vl-|vision|fuyu|paligemma|neva|kosmos|florence|clip", re.I)
-STATE = {"api_key": "", "model": ""}
+RUNFILE = os.path.join(os.path.expanduser("~"), ".nvclaude-run.json")   # who is serving on which port, with its token
+STATE = {"api_key": "", "model": "", "token": ""}
 
 # ----------------------------------------------------------------------------- helpers
 def log(*a): print("\033[1;32m==>\033[0m", *a, flush=True)
@@ -391,7 +392,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self): self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
 
+    def _authed(self):
+        """Only the Claude Code we launched (or a client given the token) may spend the NVIDIA key."""
+        if not STATE["token"]: return True
+        auth = self.headers.get("Authorization") or ""
+        got = auth[7:] if auth.lower().startswith("bearer ") else self.headers.get("x-api-key") or ""
+        if secrets.compare_digest(got, STATE["token"]): return True
+        self._json(401, {"type": "error", "error": {"type": "authentication_error", "message": "nvclaude: bad or missing proxy token"}}); return False
+
     def do_GET(self):
+        if self.path == "/nvclaude":                                  # unauthenticated liveness/identity probe
+            return self._json(200, {"nvclaude": True, "model": STATE["model"], "pid": os.getpid()})
+        if not self._authed(): return
         if self.path.split("?")[0] == "/v1/models":
             try: ids = catalog()
             except Exception as e: return self._err(502, str(e))
@@ -413,6 +425,7 @@ class Handler(BaseHTTPRequestHandler):
         return http(UPSTREAM + "/chat/completions", "POST", body, hdr, timeout=600)
 
     def _post(self):
+        if not self._authed(): return
         n = int(self.headers.get("Content-Length") or 0)
         try: req = json.loads(self.rfile.read(n) or b"{}")
         except Exception: return self._err(400, "bad json")
@@ -446,7 +459,11 @@ class Handler(BaseHTTPRequestHandler):
         raise last
 
     def _once(self, up, req, schemas):
-        r = json.load(up); ch = (r.get("choices") or [{}])[0]; m = ch.get("message", {})
+        try: r = json.load(up)
+        finally:
+            try: up.close()
+            except Exception: pass
+        ch = (r.get("choices") or [{}])[0]; m = ch.get("message", {})
         content = []
         think = m.get("reasoning_content") or m.get("reasoning")
         if think and os.environ.get("NVCLAUDE_SHOW_THINKING", "1") != "0": content.append({"type": "thinking", "thinking": think, "signature": ""})
@@ -552,9 +569,31 @@ class Handler(BaseHTTPRequestHandler):
             try: up.close()
             except Exception: pass
 
-def serve(port):
+def running_instance(port):
+    """If an nvclaude proxy already serves on port, return its run info (port, token, model); else None."""
+    try:
+        info = json.load(http("http://127.0.0.1:%d/nvclaude" % port, timeout=2))
+        if not info.get("nvclaude"): return None
+        run = json.load(open(RUNFILE))
+        return run if run.get("port") == port and run.get("token") else None
+    except Exception: return None
+
+def serve(port, token=None, write_runfile=False):
+    STATE["token"] = token if token is not None else secrets.token_urlsafe(24)
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler); srv.daemon_threads = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start(); return srv
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    if write_runfile:
+        with open(RUNFILE, "w") as f: json.dump({"pid": os.getpid(), "port": port, "token": STATE["token"], "model": STATE["model"]}, f)
+        try: os.chmod(RUNFILE, 0o600)
+        except Exception: pass
+    return srv
+
+def stop(srv):
+    try: srv.shutdown(); srv.server_close()
+    except Exception: pass
+    try:
+        if json.load(open(RUNFILE)).get("pid") == os.getpid(): os.remove(RUNFILE)
+    except Exception: pass
 
 # ----------------------------------------------------------------------------- launcher
 def ensure_claude():
@@ -567,10 +606,10 @@ def ensure_claude():
     os.environ["PATH"] = os.pathsep.join([os.path.expanduser("~/.local/bin"), os.environ.get("PATH", "")])
     return shutil.which("claude") or die("claude still not on PATH; open a new shell and re-run")
 
-def launch_env(model, port, base=None):
+def launch_env(model, port, base=None, token="nvclaude"):
     """Environment for the claude process. Routing vars are forced; CLAUDE_CODE_* toggles keep any value the user already set."""
     env = dict(os.environ if base is None else base)
-    env.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port, "ANTHROPIC_AUTH_TOKEN": "nvclaude", "ANTHROPIC_API_KEY": "",
+    env.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_API_KEY": "",
                 "ANTHROPIC_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_OPUS_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_SONNET_MODEL": PREFIX + model,
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": PREFIX + model, "CLAUDE_CODE_SUBAGENT_MODEL": PREFIX + model})
     ctx = context_for(model)
@@ -639,18 +678,29 @@ def main():
     if model != cfg.get("model"): cfg["model"] = model; save_cfg(cfg)
     STATE["model"] = model
 
-    port = free_port(a.port); serve(port)
+    running = running_instance(a.port)
+    if running and not a.serve_only:
+        port, token = running["port"], running["token"]; srv = None
+        log("Reusing the nvclaude proxy already running on :%d (pid %s)" % (port, running.get("pid")))
+    else:
+        port = free_port(a.port)
+        if port != a.port: log("Port %d is busy (not nvclaude); using :%d instead" % (a.port, port))
+        srv = serve(port, os.environ.get("NVCLAUDE_TOKEN") or None, write_runfile=True); token = STATE["token"]
     if a.serve_only:
         log("Proxy on http://127.0.0.1:%d  (ANTHROPIC_BASE_URL)  default model: %s" % (port, model))
+        log("Proxy token (ANTHROPIC_AUTH_TOKEN): %s" % token)
         try:
             while True: time.sleep(3600)
-        except KeyboardInterrupt: return
-
+        except KeyboardInterrupt: stop(srv); return
     claude = ensure_claude()
-    env = launch_env(model, port)
+    env = launch_env(model, port, token=token)
     args = a.claude_args
     log("Claude Code on %s  (proxy :%d). Switch models with /model or `nvclaude pick`." % (model, port))
-    sys.exit(subprocess.call([claude] + args, env=env))
+    try: rc = subprocess.call([claude] + args, env=env)
+    except KeyboardInterrupt: rc = 130
+    finally:
+        if srv is not None: stop(srv)
+    sys.exit(rc)
 
 if __name__ == "__main__":
     main()

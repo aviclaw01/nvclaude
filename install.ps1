@@ -12,7 +12,15 @@ if (-not (Get-Command py -ErrorAction SilentlyContinue) -and -not (Get-Command p
 }
 
 $Target = Join-Path $Dir "nvclaude.py"
-if (Test-Path $Src) { Copy-Item $Src $Target -Force } else { Invoke-RestMethod $Src -OutFile $Target }
+if (Test-Path $Src) { Copy-Item $Src $Target -Force } else {
+  Invoke-RestMethod $Src -OutFile $Target
+  try {
+    $expected = ((Invoke-RestMethod "https://raw.githubusercontent.com/aviclaw01/nvclaude/main/nvclaude.py.sha256") -split '\s+')[0]
+    $actual = (Get-FileHash $Target -Algorithm SHA256).Hash.ToLower()
+    if ($expected -and $actual -ne $expected.ToLower()) { Remove-Item $Target; throw "checksum mismatch for nvclaude.py (expected $expected, got $actual)" }
+    if ($expected) { Write-Host "==> Checksum verified" -ForegroundColor Green }
+  } catch [System.Net.WebException] { }
+}
 
 $Py = if (Get-Command py -ErrorAction SilentlyContinue) { "py -3" } else { "python" }
 $Shim = "@echo off`r`n$Py `"%LOCALAPPDATA%\nvclaude\nvclaude.py`" %*`r`n"
@@ -24,5 +32,7 @@ if ($UserPath -notlike "*$Dir*") {
   $env:Path = "$Dir;$env:Path"
 }
 
-Write-Host "==> nvclaude installed. From now on just type:  nvclaude" -ForegroundColor Green
+$ver = (Select-String -Path $Target -Pattern '__version__ = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+Write-Host "==> nvclaude $ver installed. From now on just type:  nvclaude" -ForegroundColor Green
+Write-Host "    (already-open terminals need to be restarted to see the new PATH entry)" -ForegroundColor DarkGray
 & (Join-Path $Dir "nvclaude.cmd") @args

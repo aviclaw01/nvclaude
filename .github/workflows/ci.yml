@@ -35,6 +35,14 @@ jobs:
       - name: shellcheck
         if: runner.os == 'Linux'
         run: shellcheck -S warning install.sh
+      - name: checksum file matches nvclaude.py
+        if: runner.os == 'Linux'
+        run: |
+          sha256sum -c nvclaude.py.sha256 || { echo "::error::nvclaude.py.sha256 is stale. Run: sha256sum nvclaude.py > nvclaude.py.sha256"; exit 1; }
+      - name: installer without a TTY prints guidance instead of launching
+        run: |
+          export HOME="$(mktemp -d)"
+          NVCLAUDE_SRC="$PWD/nvclaude.py" bash install.sh </dev/null | grep -q "No interactive terminal"
       - name: install into a throwaway HOME and run the installed command
         run: |
           export HOME="$(mktemp -d)"; touch "$HOME/.bashrc"
@@ -72,3 +80,22 @@ jobs:
           if ($userPath -notlike "*$dir*") { throw "user PATH not updated: $userPath" }
           $out = & (Join-Path $dir "nvclaude.cmd") info nvidia/nemotron-3-super-120b-a12b
           if (($out -join " ") -notmatch "262,144") { throw "installed command failed: $out" }
+
+  live:
+    name: live smoke test (manual, needs NVIDIA_API_KEY secret)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest tests.test_live -v
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: models.live.json
+          path: docs/models.live.json
+          if-no-files-found: ignore

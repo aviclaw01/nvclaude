@@ -71,4 +71,4 @@ jobs:
           $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
           if ($userPath -notlike "*$dir*") { throw "user PATH not updated: $userPath" }
           $out = & (Join-Path $dir "nvclaude.cmd") info nvidia/nemotron-3-super-120b-a12b
-          if ($out -notmatch "262,144") { throw "installed command failed: $out" }
+          if (($out -join " ") -notmatch "262,144") { throw "installed command failed: $out" }

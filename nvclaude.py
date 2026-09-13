@@ -16,6 +16,9 @@ Usage:
   nvclaude list            # print the catalog (add --refresh to bypass the 24h cache)
   nvclaude bench [model…]  # measure first-token latency, streaming and tool calling; feeds the picker badges
   nvclaude info [model]    # context window / output cap / vision for a model
+  nvclaude status          # key, models, proxy, versions, and what to do next
+  nvclaude fast <model>    # model for Claude Code's quick Haiku-tier work (default: Nemotron 3.5 Lightning); 'none' resets
+  nvclaude subagent <model># model for spawned subagents (default: the main model); 'pick' opens the picker
   nvclaude key             # re-enter the NVIDIA API key
   nvclaude serve           # proxy only (for VS Code / other clients)
   nvclaude version         # nvclaude, Python and Claude Code versions
@@ -29,7 +32,7 @@ Config lives in ~/.nvclaude.json (chmod 600).
 import argparse, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 SELF_URL = os.environ.get("NVCLAUDE_SRC", "https://raw.githubusercontent.com/aviclaw01/nvclaude/main/nvclaude.py")
 UPSTREAM = os.environ.get("NVCLAUDE_UPSTREAM", "https://integrate.api.nvidia.com/v1")
 CONFIG = os.path.join(os.path.expanduser("~"), ".nvclaude.json")
@@ -694,12 +697,13 @@ def ensure_claude():
     os.environ["PATH"] = os.pathsep.join([os.path.expanduser("~/.local/bin"), os.environ.get("PATH", "")])
     return shutil.which("claude") or die("claude still not on PATH; open a new shell and re-run")
 
-def launch_env(model, port, base=None, token="nvclaude"):
-    """Environment for the claude process. Routing vars are forced; CLAUDE_CODE_* toggles keep any value the user already set."""
+def launch_env(model, port, base=None, token="nvclaude", fast=None, subagent=None):
+    """Environment for the claude process. Routing vars are forced; CLAUDE_CODE_* toggles keep any value the user already set.
+    fast: model for Claude Code's Haiku tier (titles, quick classification); subagent: model for spawned agents."""
     env = dict(os.environ if base is None else base)
     env.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_API_KEY": "",
                 "ANTHROPIC_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_OPUS_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_SONNET_MODEL": PREFIX + model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": PREFIX + model, "CLAUDE_CODE_SUBAGENT_MODEL": PREFIX + model})
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": PREFIX + (fast or model), "CLAUDE_CODE_SUBAGENT_MODEL": PREFIX + (subagent or model)})
     ctx = context_for(model)
     for k, v in {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(ctx), "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(ctx * 0.9)),
                  "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
@@ -779,38 +783,24 @@ def pick(ids, current):
 SHORT = {"nano": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "super": "nvidia/nemotron-3-super-120b-a12b",
          "ultra": "nvidia/nemotron-3-ultra-550b-a55b", "lightning": "nvidia/nemotron-3.5-lightning-30b-a3b"}
 
-def main():
-    argv = sys.argv[1:]
-    if argv[:1] in (["-h"], ["--help"], ["help"]): print(__doc__); return
-    claude_args = []
-    if "--" in argv: i = argv.index("--"); argv, claude_args = argv[:i], argv[i + 1:]
-    cmd = argv[0] if argv else ""
-    if cmd == "version": return cmd_version()
-    if cmd == "update": return cmd_update()
-    if cmd == "uninstall": return cmd_uninstall()
-    if cmd == "info":
-        m = argv[1] if len(argv) > 1 else load_cfg().get("model", "")
-        m or die("nvclaude info <model-id>")
-        print("%s\n  context window: %s tokens%s\n  max output sent: %d tokens\n  vision: %s" % (m, format(context_for(m), ","),
-              "" if m in CONTEXT else " (default; not verified)", min(int(os.environ.get("NVCLAUDE_MAX_TOKENS", 32768)), context_for(m) // 4),
-              "yes" if any(k in m for k in ("vision", "omni", "-vl", "gemma-3", "phi-3-vision", "neva")) else "unknown/no")); return
-    a = argparse.Namespace(list=cmd == "list", pick=cmd == "pick", serve_only=cmd == "serve", reset_key=cmd == "key", bench=cmd == "bench",
-                           model=SHORT.get(cmd) or (cmd if "/" in cmd else None),
-                           port=int(os.environ.get("NVCLAUDE_PORT", 8787)), claude_args=claude_args)
-    if cmd and not (a.list or a.pick or a.serve_only or a.reset_key or a.model or a.bench):
-        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | info | bench | key | serve | version | update | uninstall" % cmd)
-    cfg = load_cfg()
-    if a.list:
-        bad = unavailable()
-        for i in catalog(refresh="--refresh" in argv):
-            b = badge(i, cfg); print("%-48s %s" % (i, ("[" + b + "]") if b else ""))
-        return
+FAST_DEFAULT = "nvidia/nemotron-3.5-lightning-30b-a3b"      # Haiku tier: quick background work (measured 0.8s, tools ok)
+def _interactive():
+    """A real keyboard is attached. On Windows isatty() is true for NUL, so require stdout to be a terminal as well."""
+    if os.environ.get("NVCLAUDE_NONINTERACTIVE"): return False
+    try: return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception: return False
+INTERACTIVE = _interactive()
 
-    key = clean_key(os.environ.get("NVIDIA_API_KEY") or ("" if a.reset_key else cfg.get("api_key", "")))
+def mask(k): return ("nvapi-…" + k[-4:]) if k else "MISSING"
+
+def ensure_key(cfg, reset=False):
+    """Step 1: a valid NVIDIA key in STATE and on disk, or a clear exit telling the user what to do."""
+    key = clean_key(os.environ.get("NVIDIA_API_KEY") or ("" if reset else cfg.get("api_key", "")))
     if key and key != cfg.get("api_key") and not os.environ.get("NVIDIA_API_KEY"):
         log("Stored key contained stray characters; cleaned it."); cfg["api_key"] = key; save_cfg(cfg)
     if key and not KEY_RE.fullmatch(key):
         log("Stored key is not a valid NVIDIA key; please enter it again."); key = ""
+    if not key and not INTERACTIVE: die("No NVIDIA API key. Run `nvclaude key` in a terminal, or set NVIDIA_API_KEY.")
     for attempt in range(3):
         if key: break
         import getpass
@@ -820,48 +810,129 @@ def main():
             print("  That doesn't look like an NVIDIA key (expected nvapi-... with 20+ letters/digits). Try again."); key = ""; continue
         ok, why = check_key(key); print("  " + why)
         if not ok: key = ""; continue
-        cfg["api_key"] = key; save_cfg(cfg); print("  Saved nvapi-…%s to %s" % (key[-4:], CONFIG))
+        cfg["api_key"] = key; save_cfg(cfg); print("  Saved %s to %s" % (mask(key), CONFIG))
     if not key: die("no valid NVIDIA API key after 3 attempts")
-    STATE["api_key"] = key
+    STATE["api_key"] = key; return key
 
-    if a.bench:
+def resolve_model(requested):
+    """Validate a model id or shortcut typed on the command line; exit with suggestions if it is wrong."""
+    m = SHORT.get(requested, requested)
+    try: ids = catalog()
+    except Exception: ids = None
+    if ids:
+        ok, near = validate_model(m, ids)
+        if not ok: die("model '%s' is not in the build.nvidia.com catalog.%s" % (m, ("  Did you mean:\n  " + "\n  ".join(near)) if near else ""))
+    if m in unavailable(): die("model '%s' answered 'not found for this account' last time. Run `nvclaude pick`." % m)
+    return m
+
+def ensure_model(cfg, requested=None, force_pick=False):
+    """Step 2: the main model, validated, chosen interactively if needed, saved."""
+    model = resolve_model(requested) if requested else cfg.get("model", "")
+    if force_pick or not model:
+        if not INTERACTIVE: die("No model chosen. Run `nvclaude pick` in a terminal, or `nvclaude super`.")
+        model = pick(usable_catalog(), model)
+    if model != cfg.get("model"): cfg["model"] = model; save_cfg(cfg)
+    STATE["model"] = model; return model
+
+def set_tier(cfg, slot, value):
+    """`nvclaude fast <model|shortcut|none>` / `nvclaude subagent …`: route Claude Code's Haiku tier / subagents elsewhere."""
+    key = "model_" + slot
+    if value in ("none", "off", "default"): cfg.pop(key, None); save_cfg(cfg); log("%s model cleared (uses %s)" % (slot, "the built-in default" if slot == "fast" else "the main model")); return
+    if value == "pick":
+        if not INTERACTIVE: die("`nvclaude %s pick` needs a terminal" % slot)
+        value = pick(usable_catalog(), cfg.get(key, ""))
+    else: value = resolve_model(value)
+    cfg[key] = value; save_cfg(cfg); log("%s model: %s" % (slot, value))
+
+def tiers(cfg, model):
+    return cfg.get("model_fast") or FAST_DEFAULT, cfg.get("model_subagent") or model
+
+def ensure_proxy(port, serve_only):
+    """Step 3: reuse a running proxy or start one. Returns (port, token, srv-or-None)."""
+    running = None if serve_only else running_instance(port)
+    if running:
+        log("Reusing the nvclaude proxy already running on :%d (pid %s)" % (running["port"], running.get("pid")))
+        return running["port"], running["token"], None
+    p = free_port(port)
+    if p != port: log("Port %d is busy (not nvclaude); using :%d instead" % (port, p))
+    srv = serve(p, os.environ.get("NVCLAUDE_TOKEN") or None, write_runfile=True)
+    return p, STATE["token"], srv
+
+def cmd_status(cfg, port):
+    key = clean_key(os.environ.get("NVIDIA_API_KEY") or cfg.get("api_key", ""))
+    model = cfg.get("model", ""); fast, sub = tiers(cfg, model or "(main model)")
+    cat = cfg.get("catalog") or {}
+    run = running_instance(port)
+    rows = [("NVIDIA key", mask(key) + ("" if not key or KEY_RE.fullmatch(key) else "  (INVALID format)") + ("  (from NVIDIA_API_KEY env)" if os.environ.get("NVIDIA_API_KEY") else "")),
+            ("model", (model + ("  [" + badge(model, cfg) + "]" if badge(model, cfg) else "")) if model else "not chosen  -> nvclaude pick"),
+            ("fast tier (Haiku)", fast + ("" if cfg.get("model_fast") else "  (default)")),
+            ("subagents", sub + ("" if cfg.get("model_subagent") else "  (= main model)")),
+            ("context window", format(context_for(model), ",") + " tokens" if model else "-"),
+            ("proxy", ("running on :%d (pid %s)" % (run["port"], run.get("pid"))) if run else "not running (starts with nvclaude)"),
+            ("catalog cache", ("%d models, fetched %s" % (len(cat.get("ids", [])), time.strftime("%Y-%m-%d %H:%M", time.localtime(cat.get("fetched_at", 0))))) if cat else "empty"),
+            ("unavailable models", str(len(cfg.get("unavailable") or {}))), ("benchmarked models", str(len(cfg.get("bench") or {}))),
+            ("claude", claude_version()), ("python", sys.version.split()[0]), ("nvclaude", __version__), ("config", CONFIG)]
+    for k, v in rows: print("  %-20s %s" % (k, v))
+    if not key: print("\nNext: run `nvclaude key`")
+    elif not model: print("\nNext: run `nvclaude pick`")
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:1] in (["-h"], ["--help"], ["help"]): print(__doc__); return
+    claude_args = []
+    if "--" in argv: i = argv.index("--"); argv, claude_args = argv[:i], argv[i + 1:]
+    cmd = argv[0] if argv else ""; arg = argv[1] if len(argv) > 1 else ""
+    port = int(os.environ.get("NVCLAUDE_PORT", 8787))
+    cfg = load_cfg()
+    KNOWN = {"pick", "list", "info", "bench", "key", "serve", "status", "version", "update", "uninstall", "fast", "subagent"}
+    if cmd and cmd not in KNOWN and cmd not in SHORT and "/" not in cmd:
+        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | lightning | list | info | bench | status | fast | subagent | key | serve | version | update | uninstall" % cmd)
+
+    # ---- commands that need no key
+    if cmd == "version": return cmd_version()
+    if cmd == "update": return cmd_update()
+    if cmd == "uninstall": return cmd_uninstall()
+    if cmd == "status": return cmd_status(cfg, port)
+    if cmd == "info":
+        m = SHORT.get(arg, arg) or cfg.get("model", "") or die("nvclaude info <model-id>")
+        print("%s\n  context window: %s tokens%s\n  max output sent: %d tokens\n  vision: %s" % (m, format(context_for(m), ","),
+              "" if m in CONTEXT else " (default; not verified)", min(int(os.environ.get("NVCLAUDE_MAX_TOKENS", 32768)), context_for(m) // 4),
+              "yes" if any(k in m for k in ("vision", "omni", "-vl", "gemma-3", "phi-3-vision", "neva")) else "unknown/no")); return
+    if cmd == "list":
+        for i in catalog(refresh="--refresh" in argv):
+            b = badge(i, cfg); print("%-48s %s" % (i, ("[" + b + "]") if b else ""))
+        return
+    if cmd in ("fast", "subagent"): return set_tier(cfg, cmd, arg or "pick")
+
+    # ---- step 1: key
+    ensure_key(cfg, reset=(cmd == "key"))
+    if cmd == "key": log("Key ready. Run `nvclaude` to launch."); return
+    if cmd == "bench":
         targets = [SHORT.get(x, x) for x in argv[1:]] or [cfg.get("model") or die("nvclaude bench <model…>")]
         bench(targets); return
 
-    model = a.model or cfg.get("model", "")
-    if a.model:
-        try: ids = catalog()
-        except Exception: ids = None
-        if ids:
-            ok, near = validate_model(a.model, ids)
-            if not ok: die("model '%s' is not in the build.nvidia.com catalog.%s" % (a.model, ("  Did you mean:\n  " + "\n  ".join(near)) if near else ""))
-        if a.model in unavailable(): die("model '%s' answered 'not found for this account' last time. Run `nvclaude pick`." % a.model)
-    if a.pick or not model:
-        model = pick(usable_catalog(), model)
-    if model != cfg.get("model"): cfg["model"] = model; save_cfg(cfg)
-    STATE["model"] = model
+    # ---- step 2: model
+    requested = cmd if (cmd in SHORT or "/" in cmd) else None
+    model = ensure_model(cfg, requested, force_pick=(cmd == "pick" and arg == "") )
+    if cmd == "pick" and arg in ("fast", "subagent"): return set_tier(cfg, arg, "pick")
+    fast, sub = tiers(cfg, model)
 
-    running = running_instance(a.port)
-    if running and not a.serve_only:
-        port, token = running["port"], running["token"]; srv = None
-        log("Reusing the nvclaude proxy already running on :%d (pid %s)" % (port, running.get("pid")))
-    else:
-        port = free_port(a.port)
-        if port != a.port: log("Port %d is busy (not nvclaude); using :%d instead" % (a.port, port))
-        srv = serve(port, os.environ.get("NVCLAUDE_TOKEN") or None, write_runfile=True); token = STATE["token"]
-    if a.serve_only:
-        log("Proxy on http://127.0.0.1:%d  (ANTHROPIC_BASE_URL)  default model: %s" % (port, model))
+    # ---- step 3: proxy
+    p, token, srv = ensure_proxy(port, cmd == "serve")
+    if cmd == "serve":
+        log("Proxy on http://127.0.0.1:%d  (ANTHROPIC_BASE_URL)  default model: %s" % (p, model))
         log("Proxy token (ANTHROPIC_AUTH_TOKEN): %s" % token)
         try:
             while True: time.sleep(3600)
         except KeyboardInterrupt: stop(srv); return
+
+    # ---- step 4: Claude Code
     b = badge(model)
     if "SLOW" in b or "unavailable" in b: log("Warning: %s is marked %s. `nvclaude super` is a fast alternative." % (model, b))
     claude = ensure_claude()
-    env = launch_env(model, port, token=token)
-    args = a.claude_args
-    log("Claude Code on %s  (proxy :%d). Switch models with /model or `nvclaude pick`." % (model, port))
-    try: rc = subprocess.call([claude] + args, env=env)
+    env = launch_env(model, p, token=token, fast=fast, subagent=sub)
+    log("Claude Code on %s  (fast tier: %s%s; proxy :%d). Switch with /model or `nvclaude pick`." % (model, fast, "" if sub == model else "; subagents: " + sub, p))
+    try: rc = subprocess.call([claude] + claude_args, env=env)
     except KeyboardInterrupt: rc = 130
     finally:
         if srv is not None: stop(srv)

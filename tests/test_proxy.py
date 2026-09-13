@@ -341,6 +341,34 @@ class ProxyTests(unittest.TestCase):
         self.assertIn('__version__ = "9.9.9"', open(target).read())                         # untouched
         r = subprocess.run([sys.executable, target, "version"], capture_output=True, text=True); self.assertIn("nvclaude 9.9.9", r.stdout)
 
+    # ---- #3 #10 status, state machine, tiers
+    def _cli(self, *args, key=None, stdin=None):
+        import subprocess
+        env = dict(os.environ, HOME=self.tmp, USERPROFILE=self.tmp, NVCLAUDE_UPSTREAM="http://127.0.0.1:8799", NVCLAUDE_PORT="8798", NVCLAUDE_NONINTERACTIVE="1")
+        env.pop("NVIDIA_API_KEY", None)
+        if key: env["NVIDIA_API_KEY"] = key
+        return subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "nvclaude.py"), *args], capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=60)
+
+    def test_status_and_first_run_gating(self):
+        import shutil
+        cfgpath = os.path.join(self.tmp, ".nvclaude.json")
+        if os.path.exists(cfgpath): os.remove(cfgpath)
+        r = self._cli("status"); self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("MISSING", r.stdout); self.assertIn("nvclaude key", r.stdout)
+        r = self._cli(); self.assertNotEqual(r.returncode, 0); self.assertIn("nvclaude key", r.stderr)           # no key, no TTY: refuse to launch
+        r = self._cli(key="nvapi-TESTKEYTESTKEYTESTKEY0000"); self.assertNotEqual(r.returncode, 0); self.assertIn("nvclaude pick", r.stderr)   # key but no model
+        r = self._cli("fast", "nvidia/nemotron-3-super-120b-a12b"); self.assertEqual(r.returncode, 0, r.stderr)
+        r = self._cli("fast", "nvidia/nemotron-3-super"); self.assertNotEqual(r.returncode, 0); self.assertIn("Did you mean", r.stderr)
+        r = self._cli("status", key="nvapi-TESTKEYTESTKEYTESTKEY0000"); self.assertIn("nvapi-…0000", r.stdout); self.assertIn("nemotron-3-super-120b-a12b", r.stdout); self.assertIn("nvclaude pick", r.stdout)
+        r = self._cli("fast", "none"); self.assertEqual(r.returncode, 0)
+
+    def test_launch_env_tier_routing(self):
+        env = nv.launch_env("nvidia/main", 1, base={}, fast="nvidia/fast", subagent="nvidia/sub")
+        self.assertEqual(env["ANTHROPIC_MODEL"], nv.PREFIX + "nvidia/main"); self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], nv.PREFIX + "nvidia/main")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], nv.PREFIX + "nvidia/fast"); self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], nv.PREFIX + "nvidia/sub")
+        env = nv.launch_env("nvidia/main", 1, base={})
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], nv.PREFIX + "nvidia/main")
+        self.assertEqual(nv.tiers({}, "m"), (nv.FAST_DEFAULT, "m")); self.assertEqual(nv.tiers({"model_fast": "f", "model_subagent": "s"}, "m"), ("f", "s"))
+
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]
         self.assertEqual(nv.repair_args('{"command": "echo hi", "run_in_background": True}', S)[0]["run_in_background"], True)

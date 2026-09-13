@@ -397,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
     def _once(self, up, req, schemas):
         r = json.load(up); ch = (r.get("choices") or [{}])[0]; m = ch.get("message", {})
         content = []
+        think = m.get("reasoning_content") or m.get("reasoning")
+        if think and os.environ.get("NVCLAUDE_SHOW_THINKING", "1") != "0": content.append({"type": "thinking", "thinking": think, "signature": ""})
         if m.get("content"): content.append({"type": "text", "text": m["content"]})
         calls = [{"id": tc.get("id"), "name": (tc.get("function") or {}).get("name"), "args": (tc.get("function") or {}).get("arguments")}
                  for tc in m.get("tool_calls") or []]
@@ -432,13 +434,22 @@ class Handler(BaseHTTPRequestHandler):
                 ev("error", {"type": "error", "error": {"type": err_type(code), "message": msg}}); return end()
         except (BrokenPipeError, ConnectionResetError): return
         up = box["up"]
-        idx, text_open, calls, usage, finish, last_ping = -1, False, {}, None, None, time.time()
+        idx, cur, calls, usage, finish, last_ping = -1, None, {}, None, None, time.time()
         t0, first, dbg = time.time(), None, bool(os.environ.get("NVCLAUDE_DEBUG"))
-        # Text streams live. Tool calls are buffered until the stream ends so their arguments can be
+        show_thinking = os.environ.get("NVCLAUDE_SHOW_THINKING", "1") != "0"
+        # Text and thinking stream live. Tool calls are buffered until the stream ends so their arguments can be
         # validated/repaired as a whole (Claude Code only runs tools after the message completes anyway).
-        def close_text():
-            nonlocal text_open
-            if text_open: ev("content_block_stop", {"type": "content_block_stop", "index": idx}); text_open = False
+        def close_block():
+            nonlocal cur
+            if cur is not None:
+                if cur == "thinking": ev("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "signature_delta", "signature": ""}})
+                ev("content_block_stop", {"type": "content_block_stop", "index": idx}); cur = None
+        def open_block(kind):
+            nonlocal idx, cur
+            if cur != kind:
+                close_block(); idx += 1; cur = kind
+                ev("content_block_start", {"type": "content_block_start", "index": idx, "content_block":
+                    {"type": "text", "text": ""} if kind == "text" else {"type": "thinking", "thinking": ""}})
         try:
             for raw in up:
                 line = raw.decode(errors="replace").strip()
@@ -454,12 +465,14 @@ class Handler(BaseHTTPRequestHandler):
                 for ch in j.get("choices") or []:
                     d = ch.get("delta") or {}
                     if ch.get("finish_reason"): finish = ch["finish_reason"]
-                    if d.get("reasoning_content") or d.get("reasoning"):
-                        if time.time() - last_ping > 5: ev("ping", {"type": "ping"}); last_ping = time.time()
+                    r = d.get("reasoning_content") or d.get("reasoning")
+                    if r:
+                        if show_thinking:
+                            open_block("thinking")
+                            ev("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "thinking_delta", "thinking": r}})
+                        elif time.time() - last_ping > 5: ev("ping", {"type": "ping"}); last_ping = time.time()
                     if d.get("content"):
-                        if not text_open:
-                            idx += 1; text_open = True
-                            ev("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
+                        open_block("text")
                         ev("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": d["content"]}})
                     for tc in d.get("tool_calls") or []:
                         i = tc.get("index", 0); fn = tc.get("function") or {}
@@ -468,8 +481,8 @@ class Handler(BaseHTTPRequestHandler):
                         if fn.get("name") and not c["name"]: c["name"] = fn["name"]
                         if fn.get("arguments"): c["args"] += fn["arguments"]
                         if time.time() - last_ping > 5: ev("ping", {"type": "ping"}); last_ping = time.time()
-            close_text()
-            if dbg: log("<- stream done in %.1fs: finish=%s text_blocks=%d tool_calls=%d" % (time.time() - t0, finish, idx + 1, len(calls)))
+            close_block()
+            if dbg: log("<- stream done in %.1fs: finish=%s blocks=%d tool_calls=%d" % (time.time() - t0, finish, idx + 1, len(calls)))
             blocks, ok = tool_blocks([calls[i] for i in sorted(calls)], schemas)
             for b in blocks:
                 idx += 1

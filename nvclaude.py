@@ -13,7 +13,8 @@ Usage:
   nvclaude pick            # choose a different model
   nvclaude ultra           # shortcuts: nano | super | ultra  (Nemotron 3)
   nvclaude nvidia/nemotron-3.5-lightning-30b-a3b   # or any exact model id
-  nvclaude list            # print the catalog
+  nvclaude list            # print the catalog (add --refresh to bypass the 24h cache)
+  nvclaude bench [model…]  # measure first-token latency, streaming and tool calling; feeds the picker badges
   nvclaude info [model]    # context window / output cap / vision for a model
   nvclaude key             # re-enter the NVIDIA API key
   nvclaude serve           # proxy only (for VS Code / other clients)
@@ -70,12 +71,93 @@ def check_key(k):
     except Exception as e:
         return True, "could not reach NVIDIA (%s); continuing" % e
 
-def catalog():
-    """Chat-capable models on build.nvidia.com (public endpoint, no key needed)."""
+CATALOG_TTL = 86400
+KNOWN_SLOW = {"deepseek-ai/deepseek-v4-pro-0813": "3-4 min to first byte, 504 on full requests (measured 2026-09-13)"}
+
+def fetch_catalog():
     data = json.load(http(UPSTREAM + "/models", timeout=20))["data"]
     ids = sorted(m["id"] for m in data if not SKIP.search(m["id"]))
     ids.sort(key=lambda i: (0 if "nemotron" in i else 1, i))   # NVIDIA's own models first
     return ids
+
+def catalog(refresh=False, allow_stale=False):
+    """Chat-capable models on build.nvidia.com, cached in the config for CATALOG_TTL. allow_stale: answer from cache
+    immediately and refresh in the background (used by /v1/models, which Claude Code times out after 3s)."""
+    cfg = load_cfg(); c = cfg.get("catalog") or {}
+    age = time.time() - c.get("fetched_at", 0)
+    if c.get("ids") and not refresh and (age < CATALOG_TTL or allow_stale):
+        if age >= CATALOG_TTL: threading.Thread(target=lambda: catalog(refresh=True), daemon=True).start()
+        return c["ids"]
+    try:
+        ids = fetch_catalog()
+        cfg = load_cfg(); cfg["catalog"] = {"ids": ids, "fetched_at": time.time()}; save_cfg(cfg)
+        return ids
+    except Exception as e:
+        if c.get("ids"):
+            log("catalog fetch failed (%s); using the cached list from %s" % (e, time.strftime("%Y-%m-%d", time.localtime(c["fetched_at"]))))
+            return c["ids"]
+        raise
+
+def unavailable():
+    return set((load_cfg().get("unavailable") or {}).keys())
+
+def mark_unavailable(model, why):
+    cfg = load_cfg(); cfg.setdefault("unavailable", {})[model] = {"why": why[:200], "at": time.time()}; save_cfg(cfg)
+
+def usable_catalog(**kw):
+    bad = unavailable(); return [i for i in catalog(**kw) if i not in bad]
+
+def validate_model(model, ids):
+    """(ok, suggestions) for a model id typed on the command line."""
+    if model in ids: return True, []
+    import difflib
+    return False, difflib.get_close_matches(model, ids, n=3, cutoff=0.4)
+
+def badge(model, cfg=None):
+    """Short annotation for the picker: latency, tool support, slowness, availability."""
+    cfg = cfg if cfg is not None else load_cfg()
+    if model in (cfg.get("unavailable") or {}): return "unavailable for this account"
+    b = (cfg.get("bench") or {}).get(model)
+    if b:
+        if b.get("error"): return "bench: " + b["error"]
+        parts = ["%.0fs to first token" % b["ttfb"]]
+        if b["ttfb"] > 60: parts.append("SLOW")
+        parts.append("tools ok" if b.get("tool") else "no tool call")
+        if not b.get("streams"): parts.append("no streaming")
+        return ", ".join(parts)
+    if model in KNOWN_SLOW: return "SLOW: " + KNOWN_SLOW[model]
+    return ""
+
+def bench(models, timeout=None):
+    """Measure time-to-first-token, streaming and tool calling for each model; store under config['bench']."""
+    timeout = timeout or int(os.environ.get("NVCLAUDE_BENCH_TIMEOUT", 180))
+    hdr = {"Content-Type": "application/json", "Authorization": "Bearer " + STATE["api_key"], "Accept": "text/event-stream"}
+    tool = [{"type": "function", "function": {"name": "ping", "description": "reply tool", "parameters":
+             {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}}]
+    print("%-46s %10s %8s %6s %7s  %s" % ("model", "first tok", "total", "tools", "stream", "note"))
+    results = {}
+    for m in models:
+        body = {"model": m, "messages": [{"role": "user", "content": "Call the ping tool with text=pong. TOOLTEST"}], "max_tokens": 64,
+                "stream": True, "tools": tool, "tool_choice": "auto"}
+        t0 = time.time(); first = None; last = None; lines = 0; tool_ok = False; err = None
+        try:
+            r = http(UPSTREAM + "/chat/completions", "POST", json.dumps(body).encode(), hdr, timeout=timeout)
+            for raw in r:
+                lines += 1; now = time.time()
+                if first is None: first = now - t0
+                last = now
+                line = raw.decode(errors="replace").strip()
+                if line.startswith("data:") and "ping" in line and "tool_calls" in line: tool_ok = True
+        except urllib.error.HTTPError as e:
+            msg = _read_err(e); err = "HTTP %d" % e.code
+            if e.code == 404: mark_unavailable(m, msg); err = "unavailable for this account"
+        except Exception as e: err = "timeout after %ds" % timeout if "timed out" in str(e) else str(e)[:40]
+        total = time.time() - t0
+        res = {"ttfb": round(first or total, 1), "total": round(total, 1), "tool": tool_ok, "streams": bool(first and last and last - first > 0.05 and lines > 3), "error": err, "at": time.time()}
+        results[m] = res
+        cfg = load_cfg(); cfg.setdefault("bench", {})[m] = res; save_cfg(cfg)
+        print("%-46s %9.1fs %7.1fs %6s %7s  %s" % (m[:46], res["ttfb"], res["total"], "yes" if tool_ok else "no", "yes" if res["streams"] else "no", err or ""))
+    return results
 
 def free_port(start):
     for p in range(start, start + 50):
@@ -405,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"nvclaude": True, "model": STATE["model"], "pid": os.getpid()})
         if not self._authed(): return
         if self.path.split("?")[0] == "/v1/models":
-            try: ids = catalog()
+            try: ids = usable_catalog(allow_stale=True)
             except Exception as e: return self._err(502, str(e))
             data = [{"id": PREFIX + i, "display_name": i, "description": "build.nvidia.com", "type": "model"} for i in ids]
             return self._json(200, {"data": data, "has_more": False})
@@ -452,6 +534,7 @@ class Handler(BaseHTTPRequestHandler):
             try: return self._upstream(json.dumps(o).encode(), hdr)
             except urllib.error.HTTPError as e:
                 e.msg_text = _read_err(e); last = e
+                if e.code == 404 and "not found" in e.msg_text.lower(): mark_unavailable(base["model"], e.msg_text)
                 if e.code != 400: raise
                 change = adapt_after_400(o, e.msg_text, compat)
                 if not change: raise
@@ -622,9 +705,10 @@ def launch_env(model, port, base=None, token="nvclaude"):
 
 def pick(ids, current):
     print("\nModels on build.nvidia.com (%d). Type a number, or text to filter, Enter for default.\n" % len(ids))
-    shown = ids
+    shown = ids; cfg = load_cfg()
     while True:
-        for n, i in enumerate(shown, 1): print("  %3d) %s%s" % (n, i, "   (current)" if i == current else ""))
+        for n, i in enumerate(shown, 1):
+            b = badge(i, cfg); print("  %3d) %-48s %s%s" % (n, i, "(current) " if i == current else "", ("[" + b + "]") if b else ""))
         ans = input("\n  choice [%s]: " % (current or shown[0])).strip()
         if not ans: return current or shown[0]
         if ans.isdigit() and 1 <= int(ans) <= len(shown): return shown[int(ans) - 1]
@@ -646,13 +730,17 @@ def main():
         print("%s\n  context window: %s tokens%s\n  max output sent: %d tokens\n  vision: %s" % (m, format(context_for(m), ","),
               "" if m in CONTEXT else " (default; not verified)", min(int(os.environ.get("NVCLAUDE_MAX_TOKENS", 32768)), context_for(m) // 4),
               "yes" if any(k in m for k in ("vision", "omni", "-vl", "gemma-3", "phi-3-vision", "neva")) else "unknown/no")); return
-    a = argparse.Namespace(list=cmd == "list", pick=cmd == "pick", serve_only=cmd == "serve", reset_key=cmd == "key",
+    a = argparse.Namespace(list=cmd == "list", pick=cmd == "pick", serve_only=cmd == "serve", reset_key=cmd == "key", bench=cmd == "bench",
                            model=SHORT.get(cmd) or (cmd if "/" in cmd else None),
                            port=int(os.environ.get("NVCLAUDE_PORT", 8787)), claude_args=claude_args)
-    if cmd and not (a.list or a.pick or a.serve_only or a.reset_key or a.model):
-        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | info | key | serve" % cmd)
+    if cmd and not (a.list or a.pick or a.serve_only or a.reset_key or a.model or a.bench):
+        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | info | bench | key | serve" % cmd)
     cfg = load_cfg()
-    if a.list: print("\n".join(catalog())); return
+    if a.list:
+        bad = unavailable()
+        for i in catalog(refresh="--refresh" in argv):
+            b = badge(i, cfg); print("%-48s %s" % (i, ("[" + b + "]") if b else ""))
+        return
 
     key = clean_key(os.environ.get("NVIDIA_API_KEY") or ("" if a.reset_key else cfg.get("api_key", "")))
     if key and key != cfg.get("api_key") and not os.environ.get("NVIDIA_API_KEY"):
@@ -672,9 +760,20 @@ def main():
     if not key: die("no valid NVIDIA API key after 3 attempts")
     STATE["api_key"] = key
 
+    if a.bench:
+        targets = [SHORT.get(x, x) for x in argv[1:]] or [cfg.get("model") or die("nvclaude bench <model…>")]
+        bench(targets); return
+
     model = a.model or cfg.get("model", "")
+    if a.model:
+        try: ids = catalog()
+        except Exception: ids = None
+        if ids:
+            ok, near = validate_model(a.model, ids)
+            if not ok: die("model '%s' is not in the build.nvidia.com catalog.%s" % (a.model, ("  Did you mean:\n  " + "\n  ".join(near)) if near else ""))
+        if a.model in unavailable(): die("model '%s' answered 'not found for this account' last time. Run `nvclaude pick`." % a.model)
     if a.pick or not model:
-        model = pick(catalog(), model)
+        model = pick(usable_catalog(), model)
     if model != cfg.get("model"): cfg["model"] = model; save_cfg(cfg)
     STATE["model"] = model
 
@@ -692,6 +791,8 @@ def main():
         try:
             while True: time.sleep(3600)
         except KeyboardInterrupt: stop(srv); return
+    b = badge(model)
+    if "SLOW" in b or "unavailable" in b: log("Warning: %s is marked %s. `nvclaude super` is a fast alternative." % (model, b))
     claude = ensure_claude()
     env = launch_env(model, port, token=token)
     args = a.claude_args

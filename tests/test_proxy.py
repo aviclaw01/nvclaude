@@ -2,7 +2,7 @@
 
 Run:  python3 -m unittest discover -s tests -v
 """
-import json, os, sys, threading, unittest, urllib.request
+import json, os, sys, tempfile, threading, time, unittest, urllib.request
 from http.server import ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +38,7 @@ class ProxyTests(unittest.TestCase):
         cls.mock = ThreadingHTTPServer(("127.0.0.1", 8799), mock_openai.H)
         threading.Thread(target=cls.mock.serve_forever, daemon=True).start()
         nv.STATE.update(api_key="test", model="nvidia/nemotron-3-super-120b-a12b")
+        cls.tmp = tempfile.mkdtemp(); nv.CONFIG = os.path.join(cls.tmp, "cfg.json"); nv.RUNFILE = os.path.join(cls.tmp, "run.json")   # never touch ~/.nvclaude.json
         cls.proxy = nv.serve(8797, TOKEN)
 
     @classmethod
@@ -287,6 +288,44 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(nv.running_instance(8797)["token"], TOKEN)
             self.assertIsNone(nv.running_instance(8799))                                       # the mock upstream is not nvclaude
         finally: nv.RUNFILE = old
+
+    # ---- #4 #5 #19 catalog, validation, bench
+    def test_catalog_is_cached_and_survives_network_failure(self):
+        ids = nv.catalog(refresh=True); self.assertIn("nvidia/nemotron-3-super-120b-a12b", ids)
+        real = nv.http
+        def boom(*a, **k): raise OSError("offline")
+        nv.http = boom
+        try:
+            self.assertEqual(nv.catalog(), ids)                                   # fresh cache, no network
+            cfg = nv.load_cfg(); cfg["catalog"]["fetched_at"] = time.time() - 10 * nv.CATALOG_TTL; nv.save_cfg(cfg)
+            self.assertEqual(nv.catalog(allow_stale=True), ids)                   # stale but served immediately
+            self.assertEqual(nv.catalog(), ids)                                   # refresh fails -> cached list
+        finally: nv.http = real
+
+    def test_validate_model_suggests_close_ids(self):
+        ids = nv.catalog()
+        ok, near = nv.validate_model("nvidia/nemotron-3-super", ids)
+        self.assertFalse(ok); self.assertIn("nvidia/nemotron-3-super-120b-a12b", near)
+        self.assertEqual(nv.validate_model(ids[0], ids), (True, []))
+
+    def test_404_marks_model_unavailable_and_hides_it(self):
+        nv.catalog(refresh=True)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            post("/v1/messages", {"model": nv.PREFIX + "fail/404", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(cm.exception.code, 404); self.assertIn("nvclaude pick", json.load(cm.exception)["error"]["message"])
+        self.assertIn("fail/404", nv.unavailable()); self.assertIn("unavailable", nv.badge("fail/404"))
+        cfg = nv.load_cfg(); cfg["catalog"]["ids"].append("fail/404"); nv.save_cfg(cfg)
+        data = json.load(urllib.request.urlopen(urllib.request.Request(PROXY + "/v1/models", headers={"x-api-key": TOKEN})))["data"]
+        self.assertNotIn(nv.PREFIX + "fail/404", [m["id"] for m in data])
+
+    def test_bench_measures_and_badges(self):
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()): res = nv.bench(["nvidia/nemotron-3-super-120b-a12b", "fail/404"], timeout=10)
+        r = res["nvidia/nemotron-3-super-120b-a12b"]
+        self.assertTrue(r["tool"]); self.assertIsNone(r["error"]); self.assertGreaterEqual(r["ttfb"], 0)
+        self.assertIn("tools ok", nv.badge("nvidia/nemotron-3-super-120b-a12b"))
+        self.assertEqual(res["fail/404"]["error"], "unavailable for this account")
+        self.assertIn("SLOW", nv.badge("deepseek-ai/deepseek-v4-pro-0813"))
 
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]

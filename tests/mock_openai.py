@@ -28,6 +28,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         LAST["n"] = LAST.get("n", 0) + 1
+        m = req.get("model", "")
         def bad(msg):
             b = json.dumps({"error": {"message": msg, "type": "invalid_request_error"}}).encode()
             self.send_response(400); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
@@ -46,10 +47,15 @@ class H(BaseHTTPRequestHandler):
             self.wfile.flush(); self.close_connection = True; self.wfile.write(b""); return
         LAST["req"] = req
         want_tool = bool(req.get("tools")) and "TOOLTEST" in json.dumps(req["messages"])
+        tname = "ping" if any(t["function"]["name"] == "ping" for t in req.get("tools", [])) else "Bash"
+        targs = '{"text":"pong"}' if tname == "ping" else '{"command":"echo hi"}'
+        if m == "fail/404":
+            b=json.dumps({"status":404,"title":"Not Found","detail":"Function 'abc': Not found for account 'xyz'"}).encode()
+            self.send_response(404); self.send_header("Content-Type","application/problem+json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
         if not req.get("stream"):
             msg={"role":"assistant","content":"Hello from mock.","reasoning_content":"thinking..."}
             v = variant(req)
-            if want_tool or v: msg["tool_calls"]=[{"id":"call_1","type":"function","function":{"name":"Bash","arguments": v or "{\"command\":\"echo hi\"}"}}]
+            if want_tool or v: msg["tool_calls"]=[{"id":"call_1","type":"function","function":{"name":tname,"arguments": v or targs}}]
             b=json.dumps({"id":"chatcmpl-1","choices":[{"message":msg,"finish_reason":"tool_calls" if want_tool else "stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}).encode()
             self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
         self.send_response(200); self.send_header("Content-Type","text/event-stream"); self.send_header("Transfer-Encoding","chunked"); self.end_headers()
@@ -64,9 +70,9 @@ class H(BaseHTTPRequestHandler):
             for part in chunks(v): send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":part}}]}}]})
             send({"choices":[{"delta":{},"finish_reason":"length" if "trunc" in v or v.startswith("{\"command\": \"echo h") else "tool_calls"}]})
         elif want_tool:
-            send({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]}}]})
-            send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]})
-            send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]})
+            send({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":tname,"arguments":""}}]}}]})
+            send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":targs[:10]}}]}}]})
+            send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":targs[10:]}}]},"finish_reason":"tool_calls"}]})
         else:
             send({"choices":[{"delta":{},"finish_reason":"stop"}]})
         send({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}})

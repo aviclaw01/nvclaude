@@ -14,6 +14,7 @@ Usage:
   nvclaude ultra           # shortcuts: nano | super | ultra  (Nemotron 3)
   nvclaude nvidia/nemotron-3.5-lightning-30b-a3b   # or any exact model id
   nvclaude list            # print the catalog
+  nvclaude info [model]    # context window / output cap / vision for a model
   nvclaude key             # re-enter the NVIDIA API key
   nvclaude serve           # proxy only (for VS Code / other clients)
   nvclaude -- --continue   # anything after -- goes to claude
@@ -86,6 +87,21 @@ def blocks_text(c):
     if isinstance(c, str): return c
     return "\n".join(b.get("text", "") for b in (c or []) if b.get("type") == "text")
 
+def image_part(b):
+    src = b.get("source") or {}
+    if src.get("type") == "base64": url = "data:%s;base64,%s" % (src.get("media_type", "image/png"), src.get("data", ""))
+    elif src.get("type") == "url": url = src.get("url", "")
+    else: return {"type": "text", "text": "[image omitted]"}
+    return {"type": "image_url", "image_url": {"url": url}}
+
+def strip_images(o):
+    """Replace image parts with a note (for models without vision)."""
+    for m in o.get("messages", []):
+        if isinstance(m.get("content"), list):
+            m["content"] = [p if p["type"] != "image_url" else {"type": "text", "text": "[image omitted: this model has no vision]"} for p in m["content"]]
+            if all(p["type"] == "text" for p in m["content"]): m["content"] = "\n".join(p["text"] for p in m["content"])
+    return o
+
 def to_openai(req):
     msgs = []
     sys_txt = blocks_text(req.get("system"))
@@ -107,20 +123,28 @@ def to_openai(req):
             if calls: out["tool_calls"] = calls
             if out["content"] or calls: msgs.append(out)
         else:
-            text = []
+            parts = []          # OpenAI content parts for the user turn: text and image_url
+            def add_text(t):
+                if parts and parts[-1]["type"] == "text": parts[-1]["text"] += "\n" + t
+                else: parts.append({"type": "text", "text": t})
             for b in c or []:
                 t = b.get("type")
-                if t == "text": text.append(b.get("text", ""))
+                if t == "text": add_text(b.get("text", ""))
                 elif t == "tool_result":
                     body = blocks_text(b.get("content")) or ""
                     if b.get("is_error"): body = "Error: " + body
                     msgs.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": body or "(no output)"})
-                elif t in ("image", "document"): text.append("[attachment omitted]")
-            if "\n".join(text).strip(): msgs.append({"role": "user", "content": "\n".join(text)})
+                    for ib in (b.get("content") if isinstance(b.get("content"), list) else []):     # screenshots inside tool results
+                        if ib.get("type") == "image": parts.append(image_part(ib))
+                elif t == "image": parts.append(image_part(b))
+                elif t == "document": add_text("[document attachment omitted]")
+            parts = [p for p in parts if p["type"] != "text" or p["text"].strip()]
+            if parts:
+                msgs.append({"role": "user", "content": parts[0]["text"] if len(parts) == 1 and parts[0]["type"] == "text" else parts})
     model = req.get("model", "")
     model = model[len(PREFIX):] if model.startswith(PREFIX) else (model if "/" in model else STATE["model"])
     out = {"model": model, "messages": msgs, "stream": bool(req.get("stream")),
-           "max_tokens": min(int(req.get("max_tokens") or 8192), int(os.environ.get("NVCLAUDE_MAX_TOKENS", 32768)))}
+           "max_tokens": min(int(req.get("max_tokens") or 8192), int(os.environ.get("NVCLAUDE_MAX_TOKENS", 32768)), context_for(model) // 4)}
     if out["stream"]: out["stream_options"] = {"include_usage": True}
     for k in ("temperature", "top_p"):
         if k in req: out[k] = req[k]
@@ -176,8 +200,23 @@ def simplify_schema(sc, root=None):
         if out.get("required") is None: out.pop("required", None)
     return out
 
+# Context windows as served on build.nvidia.com (verified 2026-09-13 via API errors / vendor pages). Unknown models: 128K.
+CONTEXT = {
+    "nvidia/nemotron-3-ultra-550b-a55b": 1_048_576, "nvidia/nemotron-3-super-120b-a12b": 262_144,
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": 1_048_576, "nvidia/nemotron-3.5-lightning-30b-a3b": 1_048_576,
+    "deepseek-ai/deepseek-v4-flash-0731": 1_048_576, "deepseek-ai/deepseek-v4-pro-0813": 1_048_576, "z-ai/glm-5.3-flash": 1_048_576,
+    "meta/llama-3.2-11b-vision-instruct": 131_072, "meta/llama-3.2-90b-vision-instruct": 131_072,
+}
+DEFAULT_CONTEXT = 131_072
+
+def context_for(model):
+    m = model[len(PREFIX):] if model.startswith(PREFIX) else model
+    if m in CONTEXT: return CONTEXT[m]
+    if m.startswith("nvidia/nemotron-3"): return 262_144          # conservative for other Nemotron 3.x variants
+    return DEFAULT_CONTEXT
+
 def compat_for(model):
-    return STATE.setdefault("compat", {}).setdefault(model, {"drop": set(), "schema": 0, "json_object": False})
+    return STATE.setdefault("compat", {}).setdefault(model, {"drop": set(), "schema": 0, "json_object": False, "no_vision": False})
 
 def apply_compat(o, compat):
     """Rewrite an OpenAI request according to what this model has already rejected."""
@@ -188,6 +227,7 @@ def apply_compat(o, compat):
         note = "Respond only with a JSON object matching this schema: " + json.dumps(rf["json_schema"]["schema"])
         if o["messages"] and o["messages"][0]["role"] == "system": o["messages"][0]["content"] += "\n\n" + note
         else: o["messages"].insert(0, {"role": "system", "content": note})
+    if compat["no_vision"]: strip_images(o)
     if compat["schema"] and o.get("tools"):
         for t in o["tools"]:
             t["function"]["parameters"] = simplify_schema(t["function"]["parameters"]) if compat["schema"] == 1 else {"type": "object", "properties": {}}
@@ -199,6 +239,8 @@ _SCHEMA_RX = re.compile(r"tool|function|parameters|schema|\$ref|properties", re.
 def adapt_after_400(o, msg, compat):
     """Mutate compat/o after a 400. Returns a description of the change, or None if nothing applies."""
     low = msg.lower()
+    if not compat["no_vision"] and re.search(r"multimodal|image", low) and "image_url" in json.dumps(o):
+        compat["no_vision"] = True; return "images stripped (model has no vision)"
     for p in _PARAM_RX.findall(low):
         if p == "response_format" and o.get("response_format", {}).get("type") == "json_schema" and not compat["json_object"]:
             compat["json_object"] = True; return "response_format -> json_object"
@@ -213,6 +255,15 @@ STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "c
 def err_type(code):
     return {401: "authentication_error", 403: "authentication_error", 429: "rate_limit_error", 400: "invalid_request_error",
             404: "not_found_error", 502: "overloaded_error", 503: "overloaded_error", 504: "overloaded_error", 529: "overloaded_error"}.get(code, "api_error")
+
+_CTX_RX = re.compile(r"maximum context length|context length|context window|too many tokens|max tokens must not exceed|exceeds the model|token limit|prompt is too long", re.I)
+
+def friendly(code, msg):
+    """Rewrite upstream error text so Claude Code's recovery logic recognizes it."""
+    if code == 400 and _CTX_RX.search(msg or ""): return "prompt is too long: " + msg
+    if code in (401, 403): return "NVIDIA rejected the API key. Run `nvclaude key`. Upstream said: " + msg
+    if code == 404: return "Model not available for this account. Run `nvclaude pick`. Upstream said: " + msg
+    return msg
 
 def _read_err(e):
     """Read an HTTPError body defensively: NVIDIA sometimes closes a chunked error body early (IncompleteRead)."""
@@ -336,7 +387,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
     def _err(self, code, msg):
-        self._json(code, {"type": "error", "error": {"type": err_type(code), "message": msg}})
+        self._json(code, {"type": "error", "error": {"type": err_type(code), "message": friendly(code, msg)}})
 
     def do_HEAD(self): self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
 
@@ -376,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
         schemas = {t["name"]: t.get("input_schema") or {} for t in req.get("tools", []) if t.get("name")}
         if req.get("stream"): return self._stream(lambda: self._call(body, hdr), req, schemas)
         try: up = self._call(body, hdr)
-        except urllib.error.HTTPError as e: return self._err(e.code, _read_err(e))
+        except urllib.error.HTTPError as e: return self._err(e.code, getattr(e, "msg_text", None) or _read_err(e))
         except Exception as e: return self._err(502, "upstream: %s" % e)
         self._once(up, req, schemas)
 
@@ -431,7 +482,7 @@ class Handler(BaseHTTPRequestHandler):
             if "err" in box:
                 e = box["err"]
                 code = getattr(e, "code", 502); msg = getattr(e, "msg_text", None) or (_read_err(e) if isinstance(e, urllib.error.HTTPError) else "upstream: %s" % e)
-                ev("error", {"type": "error", "error": {"type": err_type(code), "message": msg}}); return end()
+                ev("error", {"type": "error", "error": {"type": err_type(code), "message": friendly(code, msg)}}); return end()
         except (BrokenPipeError, ConnectionResetError): return
         up = box["up"]
         idx, cur, calls, usage, finish, last_ping = -1, None, {}, None, None, time.time()
@@ -522,7 +573,9 @@ def launch_env(model, port, base=None):
     env.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port, "ANTHROPIC_AUTH_TOKEN": "nvclaude", "ANTHROPIC_API_KEY": "",
                 "ANTHROPIC_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_OPUS_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_SONNET_MODEL": PREFIX + model,
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": PREFIX + model, "CLAUDE_CODE_SUBAGENT_MODEL": PREFIX + model})
-    for k, v in {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
+    ctx = context_for(model)
+    for k, v in {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(ctx), "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(ctx * 0.9)),
+                 "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
                  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
                  "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1", "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1"}.items():
         env.setdefault(k, v)
@@ -548,11 +601,17 @@ def main():
     claude_args = []
     if "--" in argv: i = argv.index("--"); argv, claude_args = argv[:i], argv[i + 1:]
     cmd = argv[0] if argv else ""
+    if cmd == "info":
+        m = argv[1] if len(argv) > 1 else load_cfg().get("model", "")
+        m or die("nvclaude info <model-id>")
+        print("%s\n  context window: %s tokens%s\n  max output sent: %d tokens\n  vision: %s" % (m, format(context_for(m), ","),
+              "" if m in CONTEXT else " (default; not verified)", min(int(os.environ.get("NVCLAUDE_MAX_TOKENS", 32768)), context_for(m) // 4),
+              "yes" if any(k in m for k in ("vision", "omni", "-vl", "gemma-3", "phi-3-vision", "neva")) else "unknown/no")); return
     a = argparse.Namespace(list=cmd == "list", pick=cmd == "pick", serve_only=cmd == "serve", reset_key=cmd == "key",
                            model=SHORT.get(cmd) or (cmd if "/" in cmd else None),
                            port=int(os.environ.get("NVCLAUDE_PORT", 8787)), claude_args=claude_args)
     if cmd and not (a.list or a.pick or a.serve_only or a.reset_key or a.model):
-        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | key | serve" % cmd)
+        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | info | key | serve" % cmd)
     cfg = load_cfg()
     if a.list: print("\n".join(catalog())); return
 

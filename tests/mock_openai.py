@@ -34,6 +34,8 @@ class H(BaseHTTPRequestHandler):
         m = req.get("model", "")
         if m == "fail/reasoning_effort" and "reasoning_effort" in req: return bad("Unsupported parameter: 'reasoning_effort' is not supported with this model.")
         if m == "fail/response_format" and req.get("response_format", {}).get("type") == "json_schema": return bad("response_format of type json_schema is not supported")
+        if m == "fail/context": return bad("This model's maximum context length is 131072 tokens. However, you requested 140000 tokens.")
+        if m == "fail/no-vision" and "image_url" in json.dumps(req.get("messages")): return bad("ValueError: Received multimodal data but multimodal processing is not enabled.")
         if m == "fail/schema" and "$ref" in json.dumps(req.get("tools", [])): return bad("Invalid schema for function 'Lookup': $ref is not supported in parameters")
         if m == "fail/schema-hard" and any(t["function"]["parameters"].get("properties") for t in req.get("tools", [])): return bad("tool parameters schema not supported")
         if req.get("model") == "fail/504":

@@ -784,7 +784,12 @@ SHORT = {"nano": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "super": "nvid
          "ultra": "nvidia/nemotron-3-ultra-550b-a55b", "lightning": "nvidia/nemotron-3.5-lightning-30b-a3b"}
 
 FAST_DEFAULT = "nvidia/nemotron-3.5-lightning-30b-a3b"      # Haiku tier: quick background work (measured 0.8s, tools ok)
-INTERACTIVE = sys.stdin.isatty()
+def _interactive():
+    """A real keyboard is attached. On Windows isatty() is true for NUL, so require stdout to be a terminal as well."""
+    if os.environ.get("NVCLAUDE_NONINTERACTIVE"): return False
+    try: return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception: return False
+INTERACTIVE = _interactive()
 
 def mask(k): return ("nvapi-…" + k[-4:]) if k else "MISSING"
 

@@ -344,7 +344,8 @@ class ProxyTests(unittest.TestCase):
     # ---- #3 #10 status, state machine, tiers
     def _cli(self, *args, key=None, stdin=None):
         import subprocess
-        env = dict(os.environ, HOME=self.tmp, NVCLAUDE_UPSTREAM="http://127.0.0.1:8799", NVCLAUDE_PORT="8798"); env.pop("NVIDIA_API_KEY", None)
+        env = dict(os.environ, HOME=self.tmp, USERPROFILE=self.tmp, NVCLAUDE_UPSTREAM="http://127.0.0.1:8799", NVCLAUDE_PORT="8798", NVCLAUDE_NONINTERACTIVE="1")
+        env.pop("NVIDIA_API_KEY", None)
         if key: env["NVIDIA_API_KEY"] = key
         return subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "nvclaude.py"), *args], capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=60)
 

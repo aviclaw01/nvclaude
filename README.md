@@ -28,6 +28,9 @@ nvclaude ultra        Nemotron 3 Ultra   (also: nano | super | lightning)
 nvclaude list         print the catalog (--refresh bypasses the 24h cache)
 nvclaude bench [m…]   measure first-token latency, streaming, tool calling; results show as badges in pick/list
 nvclaude info [model] context window, output cap, vision
+nvclaude status       key, models, proxy, versions, and what to do next
+nvclaude fast <m>     model for Claude Code's quick Haiku-tier work (default Nemotron 3.5 Lightning); 'none' resets
+nvclaude subagent <m> model for spawned subagents (default: main model); 'pick' opens the picker
 nvclaude key          change the API key
 nvclaude serve        proxy only, for VS Code or other clients (prints the token to use as ANTHROPIC_AUTH_TOKEN)
 nvclaude version      nvclaude, Python and Claude Code versions
@@ -64,8 +67,9 @@ Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_TOKEN` (pin the proxy token, e.g. for `ser
 
 ## What the launcher sets
 
-Routing (always forced): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY=` (empty), `ANTHROPIC_MODEL`,
-`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`.
+Routing (always forced): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the session token), `ANTHROPIC_API_KEY=` (empty), `ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_{OPUS,SONNET}_MODEL` (main model), `ANTHROPIC_DEFAULT_HAIKU_MODEL` (fast tier), `CLAUDE_CODE_SUBAGENT_MODEL`,
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (from the model's context window).
 
 Toggles (only if you haven't set them yourself): `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (NVIDIA models in `/model`),
 `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,

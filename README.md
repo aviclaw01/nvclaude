@@ -39,6 +39,7 @@ OpenAI-compatible API, including streaming and tool calls. Malformed tool-call J
 are surfaced as text instead of breaking the turn. Your key is stored in `~/.nvclaude.json`
 (owner-only permissions). Nothing else on your Claude Code setup is changed; run plain `claude` to go back to Anthropic.
 
+Reasoning models' thinking is shown as Claude Code thinking blocks (set `NVCLAUDE_SHOW_THINKING=0` to hide it).
 Reasoning effort picked in `/model` is sent as `reasoning_effort`; JSON-schema outputs become `response_format`. When a model
 rejects a parameter or a tool schema, the proxy retries with it dropped or simplified and remembers that for the session.
 

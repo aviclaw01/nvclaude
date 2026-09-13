@@ -45,7 +45,7 @@ class H(BaseHTTPRequestHandler):
         LAST["req"] = req
         want_tool = bool(req.get("tools")) and "TOOLTEST" in json.dumps(req["messages"])
         if not req.get("stream"):
-            msg={"role":"assistant","content":"Hello from mock."}
+            msg={"role":"assistant","content":"Hello from mock.","reasoning_content":"thinking..."}
             v = variant(req)
             if want_tool or v: msg["tool_calls"]=[{"id":"call_1","type":"function","function":{"name":"Bash","arguments": v or "{\"command\":\"echo hi\"}"}}]
             b=json.dumps({"id":"chatcmpl-1","choices":[{"message":msg,"finish_reason":"tool_calls" if want_tool else "stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}).encode()

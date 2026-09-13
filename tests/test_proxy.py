@@ -55,7 +55,7 @@ class ProxyTests(unittest.TestCase):
     def test_non_streaming_text(self):
         r = post("/v1/messages", {"model": nv.PREFIX + "nvidia/nemotron-3-super-120b-a12b", "max_tokens": 50,
                                   "messages": [{"role": "user", "content": "hi"}]})
-        self.assertEqual(r["content"][0]["text"], "Hello from mock.")
+        self.assertEqual([b for b in r["content"] if b["type"] == "text"][0]["text"], "Hello from mock.")
         self.assertEqual(r["stop_reason"], "end_turn")
         self.assertEqual(mock_openai.LAST["req"]["model"], "nvidia/nemotron-3-super-120b-a12b")
 
@@ -76,7 +76,7 @@ class ProxyTests(unittest.TestCase):
         types = [e["type"] for e in ev]
         self.assertEqual(types[0], "message_start"); self.assertEqual(types[-1], "message_stop")
         starts = [e["content_block"]["type"] for e in ev if e["type"] == "content_block_start"]
-        self.assertEqual(starts, ["text", "tool_use"])
+        self.assertEqual(starts, ["thinking", "text", "tool_use"])   # mock emits reasoning_content first
         args = "".join(e["delta"]["partial_json"] for e in ev if e.get("delta", {}).get("type") == "input_json_delta")
         self.assertEqual(json.loads(args), {"command": "echo hi"})
         self.assertEqual([e for e in ev if e["type"] == "message_delta"][0]["delta"]["stop_reason"], "tool_use")
@@ -100,7 +100,7 @@ class ProxyTests(unittest.TestCase):
             elif e["type"] == "content_block_delta":
                 d = e["delta"]
                 if d["type"] == "text_delta": cur["text"] += d["text"]
-                else: cur["input"] = json.loads(d["partial_json"])
+                elif d["type"] == "input_json_delta": cur["input"] = json.loads(d["partial_json"])
         stop = [e for e in ev if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
         return blocks, stop
 
@@ -175,7 +175,7 @@ class ProxyTests(unittest.TestCase):
 
     def test_unsupported_reasoning_effort_is_dropped_and_remembered(self):
         body = {"model": nv.PREFIX + "fail/reasoning_effort", "max_tokens": 5, "output_config": {"effort": "high"}, "messages": [{"role": "user", "content": "hi"}]}
-        r = post("/v1/messages", body); self.assertEqual(r["content"][0]["text"], "Hello from mock.")
+        r = post("/v1/messages", body); self.assertEqual([b for b in r["content"] if b["type"] == "text"][0]["text"], "Hello from mock.")
         self.assertNotIn("reasoning_effort", mock_openai.LAST["req"])
         n = mock_openai.LAST["n"]; post("/v1/messages", body)
         self.assertEqual(mock_openai.LAST["n"], n + 1)                     # second call: no failed attempt, compat remembered
@@ -210,6 +210,22 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(env["ANTHROPIC_MODEL"], nv.PREFIX + "nvidia/x"); self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], nv.PREFIX + "nvidia/x")
         self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "0")                                                   # user value kept
         self.assertEqual(env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"], "1")
+
+    def test_reasoning_becomes_thinking_blocks(self):        # #6
+        body = {"model": nv.PREFIX + "nvidia/nemotron-3-super-120b-a12b", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+        ev = events(post("/v1/messages", dict(body, stream=True), stream=True))
+        starts = [e["content_block"]["type"] for e in ev if e["type"] == "content_block_start"]
+        self.assertEqual(starts, ["thinking", "text"])
+        deltas = [e["delta"]["type"] for e in ev if e["type"] == "content_block_delta"]
+        self.assertEqual(deltas[:2], ["thinking_delta", "signature_delta"]); self.assertIn("text_delta", deltas)
+        self.assertEqual("".join(e["delta"].get("thinking", "") for e in ev if e["type"] == "content_block_delta"), "thinking...")
+        r = post("/v1/messages", body)
+        self.assertEqual([b["type"] for b in r["content"]], ["thinking", "text"]); self.assertEqual(r["content"][0]["thinking"], "thinking...")
+        os.environ["NVCLAUDE_SHOW_THINKING"] = "0"
+        try:
+            ev = events(post("/v1/messages", dict(body, stream=True), stream=True))
+            self.assertEqual([e["content_block"]["type"] for e in ev if e["type"] == "content_block_start"], ["text"])
+        finally: del os.environ["NVCLAUDE_SHOW_THINKING"]
 
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]

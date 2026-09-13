@@ -85,6 +85,86 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(len(up["tools"]), 1)  # server-side web_search tool dropped
         self.assertNotIn("thinking", json.dumps(up))
 
+    # ---- issue #9: malformed tool-call arguments are repaired or refused safely
+    TOOL = [{"name": "Bash", "description": "run", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}]
+
+    def _tool_turn(self, key, stream):
+        body = {"model": "claude-sonnet-5", "max_tokens": 50, "stream": stream, "tools": self.TOOL,
+                "messages": [{"role": "user", "content": "please run it ARGS:%s" % key}]}
+        if not stream:
+            r = post("/v1/messages", body); return r["content"], r["stop_reason"]
+        ev = events(post("/v1/messages", body, stream=True))
+        blocks, cur = [], None
+        for e in ev:
+            if e["type"] == "content_block_start": cur = dict(e["content_block"]); blocks.append(cur)
+            elif e["type"] == "content_block_delta":
+                d = e["delta"]
+                if d["type"] == "text_delta": cur["text"] += d["text"]
+                else: cur["input"] = json.loads(d["partial_json"])
+        stop = [e for e in ev if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
+        return blocks, stop
+
+    def test_repairable_variants_yield_clean_tool_use(self):
+        for key in ("good", "trailing", "single", "trunc_key", "bare", "dup", "fence", "wrapped"):
+            for stream in (True, False):
+                blocks, stop = self._tool_turn(key, stream)
+                tools = [b for b in blocks if b["type"] == "tool_use"]
+                self.assertEqual(len(tools), 1, (key, stream, blocks))
+                self.assertEqual(tools[0]["input"], {"command": "echo hi"}, (key, stream))
+                self.assertEqual(tools[0]["name"], "Bash", (key, stream))          # wrong-case name fixed
+                self.assertEqual(stop, "tool_use", (key, stream))
+
+    def test_unrecoverable_variants_become_text_not_broken_tool_use(self):
+        for key in ("garbage", "trunc_str"):
+            for stream in (True, False):
+                blocks, stop = self._tool_turn(key, stream)
+                self.assertFalse([b for b in blocks if b["type"] == "tool_use"], (key, stream))
+                self.assertIn("malformed tool call", "".join(b.get("text", "") for b in blocks), (key, stream))
+                self.assertEqual(stop, "end_turn", (key, stream))
+
+    def test_truncated_400_error_body_gets_a_json_error_not_a_dropped_socket(self):   # issue #17
+        req = urllib.request.Request(PROXY + "/v1/messages", data=json.dumps({"model": nv.PREFIX + "fail/400-truncated", "max_tokens": 5,
+                                     "messages": [{"role": "user", "content": "hi"}]}).encode(), method="POST", headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(cm.exception.code, 400)
+        body = json.load(cm.exception)
+        self.assertEqual(body["type"], "error"); self.assertIn("400", body["error"]["message"]); self.assertEqual(body["error"]["type"], "invalid_request_error")
+
+    def test_clean_key_strips_terminal_paste_artifacts(self):   # issue #17 root cause
+        raw = "\x1b[200~nvapi-abcDEF123456789012345678\x1b[201~\n"
+        self.assertEqual(nv.clean_key(raw), "nvapi-abcDEF123456789012345678")
+        self.assertTrue(nv.KEY_RE.fullmatch(nv.clean_key(raw)))
+        self.assertIsNone(nv.KEY_RE.fullmatch(nv.clean_key("nvapi-short")))
+
+    def test_streaming_pings_while_upstream_is_slow(self):
+        os.environ["NVCLAUDE_PING_SECS"] = "0.5"
+        try:
+            ev = events(post("/v1/messages", {"model": nv.PREFIX + "slow/2s", "max_tokens": 5, "stream": True,
+                                              "messages": [{"role": "user", "content": "hi"}]}, stream=True))
+        finally: del os.environ["NVCLAUDE_PING_SECS"]
+        types = [e["type"] for e in ev]
+        self.assertEqual(types[0], "message_start")
+        self.assertGreaterEqual(types.count("ping"), 2)                       # kept alive while waiting
+        self.assertEqual(types[-1], "message_stop")
+        self.assertIn("Hello from mock.", "".join(e["delta"]["text"] for e in ev if e.get("delta", {}).get("type") == "text_delta"))
+
+    def test_streaming_upstream_failure_is_an_in_stream_error_event(self):
+        ev = events(post("/v1/messages", {"model": nv.PREFIX + "fail/504", "max_tokens": 5, "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]}, stream=True))
+        self.assertEqual([e["type"] for e in ev], ["message_start", "error"])
+        self.assertEqual(ev[1]["error"]["type"], "overloaded_error"); self.assertIn("timed out", ev[1]["error"]["message"])
+
+    def test_error_types(self):
+        for code, t in ((401, "authentication_error"), (429, "rate_limit_error"), (400, "invalid_request_error"), (504, "overloaded_error"), (418, "api_error")):
+            self.assertEqual(nv.err_type(code), t)
+
+    def test_repair_args_unit(self):
+        S = self.TOOL[0]["input_schema"]
+        self.assertEqual(nv.repair_args('{"command": "echo hi", "run_in_background": True}', S)[0]["run_in_background"], True)
+        self.assertEqual(nv.repair_args("[1, 2]", S), (None, "not-an-object"))
+        self.assertEqual(nv.repair_args('{"command": "echo hi}', S), (None, "unparseable"))   # unterminated string: never guessed
+        self.assertEqual(nv.repair_args("", S), ({}, "empty"))
+
 
 if __name__ == "__main__":
     unittest.main()

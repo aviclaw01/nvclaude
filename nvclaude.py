@@ -137,6 +137,10 @@ def to_openai(req):
 
 STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "content_filter": "end_turn"}
 
+def err_type(code):
+    return {401: "authentication_error", 403: "authentication_error", 429: "rate_limit_error", 400: "invalid_request_error",
+            404: "not_found_error", 502: "overloaded_error", 503: "overloaded_error", 504: "overloaded_error", 529: "overloaded_error"}.get(code, "api_error")
+
 def _read_err(e):
     """Read an HTTPError body defensively: NVIDIA sometimes closes a chunked error body early (IncompleteRead)."""
     try: msg = e.read().decode(errors="replace")
@@ -259,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
     def _err(self, code, msg):
-        self._json(code, {"type": "error", "error": {"type": "api_error", "message": msg}})
+        self._json(code, {"type": "error", "error": {"type": err_type(code), "message": msg}})
 
     def do_HEAD(self): self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
 
@@ -294,19 +298,21 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/v1/messages": return self._err(404, "not found")
         body = json.dumps(to_openai(req)).encode()
         hdr = {"Content-Type": "application/json", "Authorization": "Bearer " + STATE["api_key"], "Accept": "text/event-stream"}
-        try: up = self._upstream(body, hdr)
+        schemas = {t["name"]: t.get("input_schema") or {} for t in req.get("tools", []) if t.get("name")}
+        if req.get("stream"): return self._stream(lambda: self._call(body, hdr), req, schemas)
+        try: up = self._call(body, hdr)
+        except urllib.error.HTTPError as e: return self._err(e.code, _read_err(e))
+        except Exception as e: return self._err(502, "upstream: %s" % e)
+        self._once(up, req, schemas)
+
+    def _call(self, body, hdr):
+        try: return self._upstream(body, hdr)
         except urllib.error.HTTPError as e:
             msg = _read_err(e)
             if e.code == 400 and "stream_options" in msg:      # some models reject it; retry without
                 o = json.loads(body); o.pop("stream_options", None)
-                try: up = self._upstream(json.dumps(o).encode(), hdr)
-                except urllib.error.HTTPError as e2: return self._err(e2.code, _read_err(e2))
-                except Exception as e2: return self._err(502, "upstream: %s" % e2)
-            else: return self._err(e.code, msg)
-        except Exception as e: return self._err(502, "upstream: %s" % e)
-        schemas = {t["name"]: t.get("input_schema") or {} for t in req.get("tools", []) if t.get("name")}
-        if req.get("stream"): self._stream(up, req, schemas)
-        else: self._once(up, req, schemas)
+                return self._upstream(json.dumps(o).encode(), hdr)
+            e.msg_text = msg; raise
 
     def _once(self, up, req, schemas):
         r = json.load(up); ch = (r.get("choices") or [{}])[0]; m = ch.get("message", {})
@@ -319,15 +325,35 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"id": r.get("id", "msg_1"), "type": "message", "role": "assistant", "model": req.get("model"),
                          "content": content, "stop_reason": stop, "stop_sequence": None, "usage": usage_of(r.get("usage"))})
 
-    def _stream(self, up, req, schemas):
+    def _stream(self, get_up, req, schemas):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
         def ev(t, d):
             chunk = ("event: %s\ndata: %s\n\n" % (t, json.dumps(d))).encode()
             self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk)); self.wfile.flush()
+        def end(): self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
         ev("message_start", {"type": "message_start", "message": {"id": "msg_%x" % time.time_ns(), "type": "message", "role": "assistant",
             "model": req.get("model"), "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        # NVIDIA's free tier can queue a request for minutes before the first byte. Claude Code aborts a stream
+        # that is silent for 300s, so wait for upstream in a thread and ping meanwhile.
+        box = {}
+        def run():
+            try: box["up"] = get_up()
+            except Exception as e: box["err"] = e
+        th = threading.Thread(target=run, daemon=True); th.start()
+        ping_every = float(os.environ.get("NVCLAUDE_PING_SECS", 15))
+        try:
+            while th.is_alive():
+                th.join(ping_every)
+                if th.is_alive(): ev("ping", {"type": "ping"})
+            if "err" in box:
+                e = box["err"]
+                code = getattr(e, "code", 502); msg = getattr(e, "msg_text", None) or (_read_err(e) if isinstance(e, urllib.error.HTTPError) else "upstream: %s" % e)
+                ev("error", {"type": "error", "error": {"type": err_type(code), "message": msg}}); return end()
+        except (BrokenPipeError, ConnectionResetError): return
+        up = box["up"]
         idx, text_open, calls, usage, finish, last_ping = -1, False, {}, None, None, time.time()
+        t0, first, dbg = time.time(), None, bool(os.environ.get("NVCLAUDE_DEBUG"))
         # Text streams live. Tool calls are buffered until the stream ends so their arguments can be
         # validated/repaired as a whole (Claude Code only runs tools after the message completes anyway).
         def close_text():
@@ -336,6 +362,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             for raw in up:
                 line = raw.decode(errors="replace").strip()
+                if first is None:
+                    first = time.time() - t0
+                    if dbg: log("<- first upstream chunk after %.1fs" % first)
                 if not line.startswith("data:"): continue
                 data = line[5:].strip()
                 if data == "[DONE]": break
@@ -360,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
                         if fn.get("arguments"): c["args"] += fn["arguments"]
                         if time.time() - last_ping > 5: ev("ping", {"type": "ping"}); last_ping = time.time()
             close_text()
+            if dbg: log("<- stream done in %.1fs: finish=%s text_blocks=%d tool_calls=%d" % (time.time() - t0, finish, idx + 1, len(calls)))
             blocks, ok = tool_blocks([calls[i] for i in sorted(calls)], schemas)
             for b in blocks:
                 idx += 1
@@ -372,9 +402,11 @@ class Handler(BaseHTTPRequestHandler):
                 ev("content_block_stop", {"type": "content_block_stop", "index": idx})
             stop = "tool_use" if ok else ("end_turn" if calls else STOP.get(finish, "end_turn"))
             ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": usage_of(usage)})
-            ev("message_stop", {"type": "message_stop"})
-            self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
+            ev("message_stop", {"type": "message_stop"}); end()
         except (BrokenPipeError, ConnectionResetError): pass
+        finally:
+            try: up.close()
+            except Exception: pass
 
 def serve(port):
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler); srv.daemon_threads = True

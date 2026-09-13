@@ -128,13 +128,35 @@ class ProxyTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req, timeout=10)
         self.assertEqual(cm.exception.code, 400)
         body = json.load(cm.exception)
-        self.assertEqual(body["type"], "error"); self.assertIn("400", body["error"]["message"])
+        self.assertEqual(body["type"], "error"); self.assertIn("400", body["error"]["message"]); self.assertEqual(body["error"]["type"], "invalid_request_error")
 
     def test_clean_key_strips_terminal_paste_artifacts(self):   # issue #17 root cause
         raw = "\x1b[200~nvapi-abcDEF123456789012345678\x1b[201~\n"
         self.assertEqual(nv.clean_key(raw), "nvapi-abcDEF123456789012345678")
         self.assertTrue(nv.KEY_RE.fullmatch(nv.clean_key(raw)))
         self.assertIsNone(nv.KEY_RE.fullmatch(nv.clean_key("nvapi-short")))
+
+    def test_streaming_pings_while_upstream_is_slow(self):
+        os.environ["NVCLAUDE_PING_SECS"] = "0.5"
+        try:
+            ev = events(post("/v1/messages", {"model": nv.PREFIX + "slow/2s", "max_tokens": 5, "stream": True,
+                                              "messages": [{"role": "user", "content": "hi"}]}, stream=True))
+        finally: del os.environ["NVCLAUDE_PING_SECS"]
+        types = [e["type"] for e in ev]
+        self.assertEqual(types[0], "message_start")
+        self.assertGreaterEqual(types.count("ping"), 2)                       # kept alive while waiting
+        self.assertEqual(types[-1], "message_stop")
+        self.assertIn("Hello from mock.", "".join(e["delta"]["text"] for e in ev if e.get("delta", {}).get("type") == "text_delta"))
+
+    def test_streaming_upstream_failure_is_an_in_stream_error_event(self):
+        ev = events(post("/v1/messages", {"model": nv.PREFIX + "fail/504", "max_tokens": 5, "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]}, stream=True))
+        self.assertEqual([e["type"] for e in ev], ["message_start", "error"])
+        self.assertEqual(ev[1]["error"]["type"], "overloaded_error"); self.assertIn("timed out", ev[1]["error"]["message"])
+
+    def test_error_types(self):
+        for code, t in ((401, "authentication_error"), (429, "rate_limit_error"), (400, "invalid_request_error"), (504, "overloaded_error"), (418, "api_error")):
+            self.assertEqual(nv.err_type(code), t)
 
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]

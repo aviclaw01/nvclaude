@@ -27,6 +27,9 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_POST(self):
         req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if req.get("model") == "fail/504":
+            b=b"upstream timed out"; self.send_response(504); self.send_header("Content-Type","text/plain"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if req.get("model") == "slow/2s": time.sleep(2)
         if req.get("model") == "fail/400-truncated":   # issue #17: 400 whose chunked body is cut off
             self.send_response(400); self.send_header("Content-Type","application/json"); self.send_header("Transfer-Encoding","chunked"); self.end_headers()
             self.wfile.flush(); self.close_connection = True; self.wfile.write(b""); return

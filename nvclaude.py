@@ -125,6 +125,11 @@ def to_openai(req):
     for k in ("temperature", "top_p"):
         if k in req: out[k] = req[k]
     if req.get("stop_sequences"): out["stop"] = req["stop_sequences"]
+    oc = req.get("output_config") or {}
+    if oc.get("effort"): out["reasoning_effort"] = {"max": "high"}.get(oc["effort"], oc["effort"])   # #21
+    fmt = oc.get("format") or req.get("output_format")
+    if isinstance(fmt, dict) and fmt.get("type") == "json_schema" and isinstance(fmt.get("schema"), dict):   # #22
+        out["response_format"] = {"type": "json_schema", "json_schema": {"name": fmt.get("name") or "output", "schema": fmt["schema"], "strict": False}}
     tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
               "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}}
              for t in req.get("tools", []) if t.get("input_schema") or t.get("type") in (None, "custom")]
@@ -134,6 +139,74 @@ def to_openai(req):
         out["tool_choice"] = {"auto": "auto", "any": "required", "none": "none",
                               "tool": {"type": "function", "function": {"name": tc.get("name")}}}.get(tc.get("type"), "auto")
     return out
+
+# ----------------------------------------------------------------------------- model compatibility (#21 #22 #23)
+_DROP_KEYS = {"$schema", "$id", "title", "examples", "default", "format", "pattern", "minLength", "maxLength", "minimum", "maximum",
+              "exclusiveMinimum", "exclusiveMaximum", "minItems", "maxItems", "uniqueItems", "additionalProperties", "$comment", "deprecated"}
+
+def simplify_schema(sc, root=None):
+    """Reduce a JSON Schema to the subset every OpenAI-compatible backend accepts."""
+    root = root if root is not None else sc
+    if isinstance(sc, list): return [simplify_schema(x, root) for x in sc]
+    if not isinstance(sc, dict): return sc
+    if "$ref" in sc:                                            # inline local refs (#/$defs/X or #/definitions/X)
+        node = root
+        for part in sc["$ref"].lstrip("#/").split("/"):
+            node = node.get(part, {}) if isinstance(node, dict) else {}
+        merged = dict(node); merged.update({k: v for k, v in sc.items() if k != "$ref"}); return simplify_schema(merged, root)
+    out = {}
+    for k, v in sc.items():
+        if k in _DROP_KEYS or k in ("$defs", "definitions"): continue
+        out[k] = simplify_schema(v, root) if k in ("properties", "items", "anyOf", "oneOf", "allOf", "not", "additionalItems") or isinstance(v, (dict, list)) and k != "enum" else v
+    if isinstance(out.get("properties"), dict): out["properties"] = {k: simplify_schema(v, root) for k, v in out["properties"].items()}
+    if isinstance(out.get("type"), list):                        # ["string","null"] -> "string"
+        t = [x for x in out["type"] if x != "null"]; out["type"] = t[0] if len(t) == 1 else (t or ["string"])[0]
+    for key in ("anyOf", "oneOf"):                              # [X, {type: null}] -> X
+        if isinstance(out.get(key), list):
+            alts = [a for a in out[key] if not (isinstance(a, dict) and a.get("type") == "null")]
+            if len(alts) == 1: base = out.pop(key); merged = dict(alts[0]); merged.update({k: v for k, v in out.items() if k != key}); out = merged
+    if isinstance(out.get("allOf"), list):                      # merge object allOf into the parent
+        for part in out.pop("allOf"):
+            if isinstance(part, dict):
+                out.setdefault("properties", {}).update(part.get("properties") or {})
+                out["required"] = sorted(set(out.get("required") or []) | set(part.get("required") or []))
+    if "properties" in out or out.get("type") == "object":
+        out["type"] = "object"; out.setdefault("properties", {})
+        if "required" in out: out["required"] = [r for r in out["required"] if r in out["properties"]] or None
+        if out.get("required") is None: out.pop("required", None)
+    return out
+
+def compat_for(model):
+    return STATE.setdefault("compat", {}).setdefault(model, {"drop": set(), "schema": 0, "json_object": False})
+
+def apply_compat(o, compat):
+    """Rewrite an OpenAI request according to what this model has already rejected."""
+    for p in compat["drop"]: o.pop(p, None)
+    rf = o.get("response_format")
+    if compat["json_object"] and rf and rf.get("type") == "json_schema":
+        o["response_format"] = {"type": "json_object"}
+        note = "Respond only with a JSON object matching this schema: " + json.dumps(rf["json_schema"]["schema"])
+        if o["messages"] and o["messages"][0]["role"] == "system": o["messages"][0]["content"] += "\n\n" + note
+        else: o["messages"].insert(0, {"role": "system", "content": note})
+    if compat["schema"] and o.get("tools"):
+        for t in o["tools"]:
+            t["function"]["parameters"] = simplify_schema(t["function"]["parameters"]) if compat["schema"] == 1 else {"type": "object", "properties": {}}
+    return o
+
+_PARAM_RX = re.compile(r"stream_options|reasoning_effort|parallel_tool_calls|response_format|top_p|temperature|stop\b")
+_SCHEMA_RX = re.compile(r"tool|function|parameters|schema|\$ref|properties", re.I)
+
+def adapt_after_400(o, msg, compat):
+    """Mutate compat/o after a 400. Returns a description of the change, or None if nothing applies."""
+    low = msg.lower()
+    for p in _PARAM_RX.findall(low):
+        if p == "response_format" and o.get("response_format", {}).get("type") == "json_schema" and not compat["json_object"]:
+            compat["json_object"] = True; return "response_format -> json_object"
+        if p in o and p != "response_format" or (p == "response_format" and p in o):
+            compat["drop"].add(p); return "dropped " + p
+    if o.get("tools") and compat["schema"] < 2 and _SCHEMA_RX.search(low):
+        compat["schema"] += 1; return "tool schemas -> %s" % ("simplified" if compat["schema"] == 1 else "description-only (model rejects JSON Schema; tool inputs will be weak)")
+    return None
 
 STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "content_filter": "end_turn"}
 
@@ -296,6 +369,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/messages/count_tokens":
             return self._json(200, {"input_tokens": max(1, len(json.dumps(req)) // 4)})
         if path != "/v1/messages": return self._err(404, "not found")
+        if os.environ.get("NVCLAUDE_DUMP"):                     # debug: append raw Anthropic requests to a file
+            with open(os.environ["NVCLAUDE_DUMP"], "a") as f: f.write(json.dumps(req) + "\n")
         body = json.dumps(to_openai(req)).encode()
         hdr = {"Content-Type": "application/json", "Authorization": "Bearer " + STATE["api_key"], "Accept": "text/event-stream"}
         schemas = {t["name"]: t.get("input_schema") or {} for t in req.get("tools", []) if t.get("name")}
@@ -306,13 +381,18 @@ class Handler(BaseHTTPRequestHandler):
         self._once(up, req, schemas)
 
     def _call(self, body, hdr):
-        try: return self._upstream(body, hdr)
-        except urllib.error.HTTPError as e:
-            msg = _read_err(e)
-            if e.code == 400 and "stream_options" in msg:      # some models reject it; retry without
-                o = json.loads(body); o.pop("stream_options", None)
-                return self._upstream(json.dumps(o).encode(), hdr)
-            e.msg_text = msg; raise
+        base = json.loads(body); compat = compat_for(base["model"])
+        last = None
+        for attempt in range(6):
+            o = apply_compat(json.loads(body), compat)
+            try: return self._upstream(json.dumps(o).encode(), hdr)
+            except urllib.error.HTTPError as e:
+                e.msg_text = _read_err(e); last = e
+                if e.code != 400: raise
+                change = adapt_after_400(o, e.msg_text, compat)
+                if not change: raise
+                log("model %s rejected the request (%s); retrying with %s" % (base["model"], e.msg_text[:80].replace("\n", " "), change))
+        raise last
 
     def _once(self, up, req, schemas):
         r = json.load(up); ch = (r.get("choices") or [{}])[0]; m = ch.get("message", {})
@@ -423,6 +503,18 @@ def ensure_claude():
     os.environ["PATH"] = os.pathsep.join([os.path.expanduser("~/.local/bin"), os.environ.get("PATH", "")])
     return shutil.which("claude") or die("claude still not on PATH; open a new shell and re-run")
 
+def launch_env(model, port, base=None):
+    """Environment for the claude process. Routing vars are forced; CLAUDE_CODE_* toggles keep any value the user already set."""
+    env = dict(os.environ if base is None else base)
+    env.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port, "ANTHROPIC_AUTH_TOKEN": "nvclaude", "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_OPUS_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_SONNET_MODEL": PREFIX + model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": PREFIX + model, "CLAUDE_CODE_SUBAGENT_MODEL": PREFIX + model})
+    for k, v in {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
+                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1", "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1"}.items():
+        env.setdefault(k, v)
+    return env
+
 def pick(ids, current):
     print("\nModels on build.nvidia.com (%d). Type a number, or text to filter, Enter for default.\n" % len(ids))
     shown = ids
@@ -483,17 +575,7 @@ def main():
         except KeyboardInterrupt: return
 
     claude = ensure_claude()
-    env = dict(os.environ)
-    env.update({
-        "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port,
-        "ANTHROPIC_AUTH_TOKEN": "nvclaude", "ANTHROPIC_API_KEY": "",
-        "ANTHROPIC_MODEL": PREFIX + model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": PREFIX + model, "ANTHROPIC_DEFAULT_SONNET_MODEL": PREFIX + model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": PREFIX + model, "CLAUDE_CODE_SUBAGENT_MODEL": PREFIX + model,
-        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-        "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-    })
+    env = launch_env(model, port)
     args = a.claude_args
     log("Claude Code on %s  (proxy :%d). Switch models with /model or `nvclaude pick`." % (model, port))
     sys.exit(subprocess.call([claude] + args, env=env))

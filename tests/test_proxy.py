@@ -2,7 +2,8 @@
 
 Run:  python3 -m unittest discover -s tests -v
 """
-import json, os, sys, threading, unittest, urllib.request
+import json, os, sys, tempfile, threading, time, unittest, urllib.request
+from unittest import mock
 from http.server import ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,22 @@ class ProxyTests(unittest.TestCase):
         ids = [m["id"] for m in data]
         self.assertTrue(all(i.startswith(nv.PREFIX) for i in ids))
         self.assertNotIn(nv.PREFIX + "nvidia/nemotron-3-embed-1b", ids)  # non-chat models filtered
+
+    def test_catalog_cache_avoids_second_network_request_within_ttl(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(nv, "CONFIG", os.path.join(tmp, "config.json")):
+            with open(nv.CONFIG, "w") as f: json.dump({"catalog": ["cached/model"], "fetched_at": time.time()}, f)
+            with mock.patch.object(nv, "http", side_effect=AssertionError("fresh cache must not fetch")) as fetch:
+                self.assertEqual(nv.catalog(), ["cached/model"])
+                self.assertEqual(nv.catalog(), ["cached/model"])
+                fetch.assert_not_called()
+
+    def test_catalog_refresh_failure_falls_back_to_cached_models(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(nv, "CONFIG", os.path.join(tmp, "config.json")):
+            with open(nv.CONFIG, "w") as f: json.dump({"catalog": ["cached/model"], "fetched_at": time.time() - nv.CATALOG_TTL - 1}, f)
+            with mock.patch.object(nv, "http", side_effect=OSError("offline")), mock.patch.object(nv, "log") as log:
+                self.assertEqual(nv.catalog(force_refresh=True), ["cached/model"])
+                log.assert_called_once()
+                self.assertIn("using the cached catalog", log.call_args.args[0])
 
     def test_count_tokens(self):
         self.assertGreater(post("/v1/messages/count_tokens", {"messages": [{"role": "user", "content": "hi"}]})["input_tokens"], 0)

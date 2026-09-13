@@ -227,6 +227,46 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual([e["content_block"]["type"] for e in ev if e["type"] == "content_block_start"], ["text"])
         finally: del os.environ["NVCLAUDE_SHOW_THINKING"]
 
+    IMG = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+
+    def test_images_become_image_url_parts(self):        # #7
+        post("/v1/messages", {"model": nv.PREFIX + "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "max_tokens": 5,
+                              "messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, self.IMG]},
+                                           {"role": "assistant", "content": "a"},
+                                           {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "shot"}, self.IMG]}]}]})
+        up = mock_openai.LAST["req"]["messages"]
+        self.assertEqual([p["type"] for p in up[0]["content"]], ["text", "image_url"])
+        self.assertTrue(up[0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,iVBOR"))
+        self.assertEqual(up[2]["role"], "tool"); self.assertEqual(up[3]["role"], "user"); self.assertEqual(up[3]["content"][0]["type"], "image_url")
+        # plain text user turns stay strings
+        post("/v1/messages", {"model": nv.PREFIX + "x/y", "max_tokens": 5, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]})
+        self.assertEqual(mock_openai.LAST["req"]["messages"][0]["content"], "hi")
+
+    def test_no_vision_model_gets_images_stripped_and_remembered(self):
+        body = {"model": nv.PREFIX + "fail/no-vision", "max_tokens": 5, "messages": [{"role": "user", "content": [{"type": "text", "text": "look"}, self.IMG]}]}
+        r = post("/v1/messages", body)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertIn("[image omitted", mock_openai.LAST["req"]["messages"][0]["content"])
+        n = mock_openai.LAST["n"]; post("/v1/messages", body); self.assertEqual(mock_openai.LAST["n"], n + 1)
+
+    def test_context_overflow_wording_triggers_compaction(self):    # #2 remainder
+        req = urllib.request.Request(PROXY + "/v1/messages", data=json.dumps({"model": nv.PREFIX + "fail/context", "max_tokens": 5,
+                                     "messages": [{"role": "user", "content": "hi"}]}).encode(), method="POST", headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req, timeout=10)
+        body = json.load(cm.exception)
+        self.assertEqual(body["error"]["type"], "invalid_request_error"); self.assertTrue(body["error"]["message"].startswith("prompt is too long"))
+        ev = events(post("/v1/messages", {"model": nv.PREFIX + "fail/context", "max_tokens": 5, "stream": True, "messages": [{"role": "user", "content": "hi"}]}, stream=True))
+        self.assertEqual(ev[-1]["type"], "error"); self.assertTrue(ev[-1]["error"]["message"].startswith("prompt is too long"))
+
+    def test_context_windows(self):                          # #8
+        self.assertEqual(nv.context_for("nvidia/nemotron-3-super-120b-a12b"), 262_144)
+        self.assertEqual(nv.context_for(nv.PREFIX + "deepseek-ai/deepseek-v4-flash-0731"), 1_048_576)
+        self.assertEqual(nv.context_for("someone/unknown-model"), 131_072)
+        env = nv.launch_env("nvidia/nemotron-3-super-120b-a12b", 1, base={})
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144"); self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], str(int(262_144 * 0.9)))
+        post("/v1/messages", {"model": nv.PREFIX + "meta/llama-3.2-11b-vision-instruct", "max_tokens": 100_000, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(mock_openai.LAST["req"]["max_tokens"], 131_072 // 4)   # capped to a quarter of the window
+
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]
         self.assertEqual(nv.repair_args('{"command": "echo hi", "run_in_background": True}', S)[0]["run_in_background"], True)

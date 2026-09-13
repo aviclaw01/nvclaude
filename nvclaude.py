@@ -47,6 +47,27 @@ def http(url, method="GET", body=None, headers=None, timeout=60):
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     return urllib.request.urlopen(req, timeout=timeout)
 
+_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")   # terminal escape sequences (bracketed paste, arrow keys)
+KEY_RE = re.compile(r"nvapi-[A-Za-z0-9_\-]{20,}")
+
+def clean_key(k):
+    """Strip escape sequences, whitespace and non-printables that terminals inject into a pasted key."""
+    k = _CSI.sub("", k or "")
+    return "".join(c for c in k if c.isprintable() and not c.isspace())
+
+def check_key(k):
+    """Ask NVIDIA whether the key works (1-token request). Returns (ok, message)."""
+    body = json.dumps({"model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}).encode()
+    try:
+        http(UPSTREAM + "/chat/completions", "POST", body, {"Content-Type": "application/json", "Authorization": "Bearer " + k}, timeout=30)
+        return True, "key accepted by NVIDIA"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403): return False, "NVIDIA rejected the key (HTTP %d)" % e.code
+        if e.code == 400: return False, "NVIDIA returned 400: the key looks malformed"
+        return True, "could not fully verify (HTTP %d); continuing" % e.code
+    except Exception as e:
+        return True, "could not reach NVIDIA (%s); continuing" % e
+
 def catalog():
     """Chat-capable models on build.nvidia.com (public endpoint, no key needed)."""
     data = json.load(http(UPSTREAM + "/models", timeout=20))["data"]
@@ -398,12 +419,22 @@ def main():
     cfg = load_cfg()
     if a.list: print("\n".join(catalog())); return
 
-    key = os.environ.get("NVIDIA_API_KEY") or ("" if a.reset_key else cfg.get("api_key", ""))
-    if not key:
+    key = clean_key(os.environ.get("NVIDIA_API_KEY") or ("" if a.reset_key else cfg.get("api_key", "")))
+    if key and key != cfg.get("api_key") and not os.environ.get("NVIDIA_API_KEY"):
+        log("Stored key contained stray characters; cleaned it."); cfg["api_key"] = key; save_cfg(cfg)
+    if key and not KEY_RE.fullmatch(key):
+        log("Stored key is not a valid NVIDIA key; please enter it again."); key = ""
+    for attempt in range(3):
+        if key: break
         import getpass
-        print("Get a free key at https://build.nvidia.com/settings/api-keys")
-        key = getpass.getpass("NVIDIA API key (nvapi-...): ").strip() or die("no key")
-        cfg["api_key"] = key; save_cfg(cfg)
+        print("Get a free key at https://build.nvidia.com/settings/api-keys  (paste it; input is hidden)")
+        key = clean_key(getpass.getpass("NVIDIA API key (nvapi-...): "))
+        if not KEY_RE.fullmatch(key):
+            print("  That doesn't look like an NVIDIA key (expected nvapi-... with 20+ letters/digits). Try again."); key = ""; continue
+        ok, why = check_key(key); print("  " + why)
+        if not ok: key = ""; continue
+        cfg["api_key"] = key; save_cfg(cfg); print("  Saved nvapi-…%s to %s" % (key[-4:], CONFIG))
+    if not key: die("no valid NVIDIA API key after 3 attempts")
     STATE["api_key"] = key
 
     model = a.model or cfg.get("model", "")

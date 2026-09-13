@@ -130,6 +130,12 @@ class ProxyTests(unittest.TestCase):
         body = json.load(cm.exception)
         self.assertEqual(body["type"], "error"); self.assertIn("400", body["error"]["message"])
 
+    def test_clean_key_strips_terminal_paste_artifacts(self):   # issue #17 root cause
+        raw = "\x1b[200~nvapi-abcDEF123456789012345678\x1b[201~\n"
+        self.assertEqual(nv.clean_key(raw), "nvapi-abcDEF123456789012345678")
+        self.assertTrue(nv.KEY_RE.fullmatch(nv.clean_key(raw)))
+        self.assertIsNone(nv.KEY_RE.fullmatch(nv.clean_key("nvapi-short")))
+
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]
         self.assertEqual(nv.repair_args('{"command": "echo hi", "run_in_background": True}', S)[0]["run_in_background"], True)

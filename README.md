@@ -30,6 +30,9 @@ nvclaude bench [m…]   measure first-token latency, streaming, tool calling; re
 nvclaude info [model] context window, output cap, vision
 nvclaude key          change the API key
 nvclaude serve        proxy only, for VS Code or other clients (prints the token to use as ANTHROPIC_AUTH_TOKEN)
+nvclaude version      nvclaude, Python and Claude Code versions
+nvclaude update       fetch the latest nvclaude.py and replace this one
+nvclaude uninstall    remove nvclaude (asks before deleting the config)
 nvclaude -- --continue   pass args through to claude
 ```
 
@@ -68,12 +71,14 @@ Toggles (only if you haven't set them yourself): `CLAUDE_CODE_ENABLE_GATEWAY_MOD
 `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
 `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`, `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`.
 
-## Uninstall
+## Update / uninstall
 
 ```
-rm ~/.local/bin/nvclaude ~/.nvclaude.json          # macOS / Linux
-Remove-Item -Recurse $env:LOCALAPPDATA\nvclaude; Remove-Item ~\.nvclaude.json   # Windows
+nvclaude update
+nvclaude uninstall
 ```
+
+Re-running the install one-liner also updates.
 
 ## Tests
 

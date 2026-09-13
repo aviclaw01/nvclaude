@@ -326,6 +326,20 @@ class ProxyTests(unittest.TestCase):
         self.assertIn("tools ok", nv.badge("nvidia/nemotron-3-super-120b-a12b"))
         self.assertEqual(res["fail/404"]["error"], "unavailable for this account")
         self.assertIn("SLOW", nv.badge("deepseek-ai/deepseek-v4-pro-0813"))
+    def test_update_replaces_self_and_refuses_broken_downloads(self):   # #12
+        import tempfile, shutil, subprocess
+        d = tempfile.mkdtemp(); target = os.path.join(d, "nvclaude"); src = os.path.join(os.path.dirname(HERE), "nvclaude.py")
+        shutil.copy(src, target)
+        newer = open(src).read().replace('__version__ = "%s"' % nv.__version__, '__version__ = "9.9.9"')
+        open(os.path.join(d, "new.py"), "w").write(newer); open(os.path.join(d, "bad.py"), "w").write("def (\n")
+        env = dict(os.environ, NVCLAUDE_SRC=os.path.join(d, "new.py"))
+        r = subprocess.run([sys.executable, target, "update"], capture_output=True, text=True, env=env); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('__version__ = "9.9.9"', open(target).read())
+        r = subprocess.run([sys.executable, target, "update"], capture_output=True, text=True, env=env); self.assertIn("Already up to date", r.stdout)
+        env["NVCLAUDE_SRC"] = os.path.join(d, "bad.py")
+        r = subprocess.run([sys.executable, target, "update"], capture_output=True, text=True, env=env); self.assertNotEqual(r.returncode, 0)
+        self.assertIn('__version__ = "9.9.9"', open(target).read())                         # untouched
+        r = subprocess.run([sys.executable, target, "version"], capture_output=True, text=True); self.assertIn("nvclaude 9.9.9", r.stdout)
 
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]

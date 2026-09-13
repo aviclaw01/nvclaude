@@ -18,6 +18,9 @@ Usage:
   nvclaude info [model]    # context window / output cap / vision for a model
   nvclaude key             # re-enter the NVIDIA API key
   nvclaude serve           # proxy only (for VS Code / other clients)
+  nvclaude version         # nvclaude, Python and Claude Code versions
+  nvclaude update          # fetch the latest nvclaude.py and replace this one
+  nvclaude uninstall       # remove nvclaude (asks before deleting the config)
   nvclaude -- --continue   # anything after -- goes to claude
 
 Inside Claude Code, /model lists every NVIDIA model too (gateway discovery).
@@ -26,6 +29,8 @@ Config lives in ~/.nvclaude.json (chmod 600).
 import argparse, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+__version__ = "0.2.0"
+SELF_URL = os.environ.get("NVCLAUDE_SRC", "https://raw.githubusercontent.com/aviclaw01/nvclaude/main/nvclaude.py")
 UPSTREAM = os.environ.get("NVCLAUDE_UPSTREAM", "https://integrate.api.nvidia.com/v1")
 CONFIG = os.path.join(os.path.expanduser("~"), ".nvclaude.json")
 PREFIX = "nvclaude/"          # exposed model ids must contain "claude" for Claude Code's /model discovery
@@ -703,6 +708,62 @@ def launch_env(model, port, base=None, token="nvclaude"):
         env.setdefault(k, v)
     return env
 
+# ----------------------------------------------------------------------------- lifecycle (#12)
+def self_path():
+    """Where this script lives: the installed file (bin/nvclaude or %LOCALAPPDATA%\\nvclaude\\nvclaude.py) or the checkout."""
+    return os.path.realpath(sys.argv[0] if sys.argv[0].endswith((".py", "nvclaude")) else __file__)
+
+def claude_version():
+    try: return subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=15).stdout.strip() or "unknown"
+    except Exception: return "not installed"
+
+def cmd_version():
+    print("nvclaude %s\npython %s\nclaude %s\nconfig %s" % (__version__, sys.version.split()[0], claude_version(), CONFIG))
+
+def cmd_update():
+    import py_compile, tempfile
+    target = self_path()
+    log("Downloading %s" % SELF_URL)
+    data = open(SELF_URL, "rb").read() if os.path.exists(SELF_URL) else http(SELF_URL, timeout=30).read()
+    m = re.search(rb'__version__ = "([^"]+)"', data); newv = m.group(1).decode() if m else "unknown"
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".nvclaude.", suffix=".py"); os.close(fd)
+    with open(tmp, "wb") as f: f.write(data)
+    try: py_compile.compile(tmp, doraise=True)
+    except Exception as e:
+        os.remove(tmp); die("downloaded file does not compile (%s); keeping the current version" % e)
+    if data == open(target, "rb").read():
+        os.remove(tmp); log("Already up to date (%s)" % __version__); return
+    try: os.chmod(tmp, os.stat(target).st_mode)
+    except Exception: pass
+    os.replace(tmp, target)
+    log("Updated %s: %s -> %s" % (target, __version__, newv))
+
+def cmd_uninstall():
+    target = self_path(); removed = []
+    for f in (target, os.path.join(os.path.dirname(target), "nvclaude.cmd"), RUNFILE):
+        if os.path.exists(f):
+            try: os.remove(f); removed.append(f)
+            except Exception as e: log("could not remove %s: %s" % (f, e))
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                "$d=Join-Path $env:LOCALAPPDATA 'nvclaude'; $p=[Environment]::GetEnvironmentVariable('Path','User'); "
+                "[Environment]::SetEnvironmentVariable('Path', (($p -split ';') | Where-Object { $_ -and $_ -ne $d }) -join ';', 'User')"],
+                capture_output=True, text=True, timeout=30)
+            removed.append("user PATH entry")
+        except Exception: pass
+    else:
+        for rc in (".zshrc", ".bashrc", ".profile"):
+            path = os.path.join(os.path.expanduser("~"), rc)
+            if os.path.exists(path):
+                lines = open(path).read().split("\n"); kept = [l for l in lines if "# nvclaude" not in l]
+                if kept != lines: open(path, "w").write("\n".join(kept)); removed.append("PATH line in " + rc)
+    if os.path.exists(CONFIG):
+        ans = input("Delete %s (your NVIDIA key, model choice, bench data)? [y/N] " % CONFIG).strip().lower()
+        if ans == "y": os.remove(CONFIG); removed.append(CONFIG)
+    log("Removed: %s" % (", ".join(removed) or "nothing"))
+    log("Claude Code itself was left installed. Bye.")
+
 def pick(ids, current):
     print("\nModels on build.nvidia.com (%d). Type a number, or text to filter, Enter for default.\n" % len(ids))
     shown = ids; cfg = load_cfg()
@@ -724,6 +785,9 @@ def main():
     claude_args = []
     if "--" in argv: i = argv.index("--"); argv, claude_args = argv[:i], argv[i + 1:]
     cmd = argv[0] if argv else ""
+    if cmd == "version": return cmd_version()
+    if cmd == "update": return cmd_update()
+    if cmd == "uninstall": return cmd_uninstall()
     if cmd == "info":
         m = argv[1] if len(argv) > 1 else load_cfg().get("model", "")
         m or die("nvclaude info <model-id>")
@@ -734,7 +798,7 @@ def main():
                            model=SHORT.get(cmd) or (cmd if "/" in cmd else None),
                            port=int(os.environ.get("NVCLAUDE_PORT", 8787)), claude_args=claude_args)
     if cmd and not (a.list or a.pick or a.serve_only or a.reset_key or a.model or a.bench):
-        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | info | bench | key | serve" % cmd)
+        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | info | bench | key | serve | version | update | uninstall" % cmd)
     cfg = load_cfg()
     if a.list:
         bad = unavailable()

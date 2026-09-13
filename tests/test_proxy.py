@@ -158,6 +158,59 @@ class ProxyTests(unittest.TestCase):
         for code, t in ((401, "authentication_error"), (429, "rate_limit_error"), (400, "invalid_request_error"), (504, "overloaded_error"), (418, "api_error")):
             self.assertEqual(nv.err_type(code), t)
 
+    # ---- #21 #22 #23 #24
+    REF_TOOL = [{"name": "Lookup", "description": "look", "input_schema": {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+                 "properties": {"q": {"$ref": "#/$defs/Q"}, "n": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}], "default": 5},
+                                "t": {"type": ["string", "null"], "format": "uri"}},
+                 "required": ["q", "gone"], "additionalProperties": False, "$defs": {"Q": {"type": "string", "maxLength": 10, "title": "Q"}}}}]
+
+    def test_effort_and_format_are_mapped(self):
+        post("/v1/messages", {"model": nv.PREFIX + "nvidia/nemotron-3-super-120b-a12b", "max_tokens": 5, "output_config": {"effort": "max",
+              "format": {"type": "json_schema", "schema": {"type": "object", "properties": {"a": {"type": "string"}}}}},
+              "thinking": {"type": "adaptive"}, "messages": [{"role": "user", "content": "hi"}]})
+        up = mock_openai.LAST["req"]
+        self.assertEqual(up["reasoning_effort"], "high")
+        self.assertEqual(up["response_format"]["type"], "json_schema"); self.assertEqual(up["response_format"]["json_schema"]["schema"]["properties"]["a"]["type"], "string")
+        self.assertNotIn("thinking", up); self.assertNotIn("output_config", up)
+
+    def test_unsupported_reasoning_effort_is_dropped_and_remembered(self):
+        body = {"model": nv.PREFIX + "fail/reasoning_effort", "max_tokens": 5, "output_config": {"effort": "high"}, "messages": [{"role": "user", "content": "hi"}]}
+        r = post("/v1/messages", body); self.assertEqual(r["content"][0]["text"], "Hello from mock.")
+        self.assertNotIn("reasoning_effort", mock_openai.LAST["req"])
+        n = mock_openai.LAST["n"]; post("/v1/messages", body)
+        self.assertEqual(mock_openai.LAST["n"], n + 1)                     # second call: no failed attempt, compat remembered
+
+    def test_json_schema_falls_back_to_json_object_with_schema_in_system(self):
+        r = post("/v1/messages", {"model": nv.PREFIX + "fail/response_format", "max_tokens": 5, "system": "sys",
+                                  "output_config": {"format": {"type": "json_schema", "schema": {"type": "object", "properties": {"z": {"type": "number"}}}}},
+                                  "messages": [{"role": "user", "content": "hi"}]})
+        up = mock_openai.LAST["req"]
+        self.assertEqual(up["response_format"], {"type": "json_object"})
+        self.assertIn('"z"', up["messages"][0]["content"]); self.assertTrue(up["messages"][0]["content"].startswith("sys"))
+
+    def test_rejected_tool_schema_is_simplified_then_description_only(self):
+        for model, expect_props in (("fail/schema", True), ("fail/schema-hard", False)):
+            r = post("/v1/messages", {"model": nv.PREFIX + model, "max_tokens": 5, "tools": self.REF_TOOL, "messages": [{"role": "user", "content": "hi"}]})
+            params = mock_openai.LAST["req"]["tools"][0]["function"]["parameters"]
+            self.assertNotIn("$ref", json.dumps(params), model)
+            self.assertEqual(bool(params.get("properties")), expect_props, model)
+            self.assertEqual(r["stop_reason"], "end_turn")
+
+    def test_simplify_schema_unit(self):
+        sc = nv.simplify_schema(self.REF_TOOL[0]["input_schema"])
+        self.assertEqual(sc["properties"]["q"], {"type": "string"})                 # $ref inlined, maxLength/title dropped
+        self.assertEqual(sc["properties"]["n"], {"type": "integer"})                # nullable anyOf collapsed, minimum/default dropped
+        self.assertEqual(sc["properties"]["t"], {"type": "string"})                 # type list collapsed, format dropped
+        self.assertEqual(sc["required"], ["q"])                                     # unknown required entry removed
+        for k in ("$schema", "$defs", "additionalProperties"): self.assertNotIn(k, sc)
+
+    def test_launch_env_defaults_and_overrides(self):
+        env = nv.launch_env("nvidia/x", 8787, base={"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "0", "ANTHROPIC_API_KEY": "sk-real"})
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787"); self.assertEqual(env["ANTHROPIC_API_KEY"], "")   # routing is forced
+        self.assertEqual(env["ANTHROPIC_MODEL"], nv.PREFIX + "nvidia/x"); self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], nv.PREFIX + "nvidia/x")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "0")                                                   # user value kept
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"], "1")
+
     def test_repair_args_unit(self):
         S = self.TOOL[0]["input_schema"]
         self.assertEqual(nv.repair_args('{"command": "echo hi", "run_in_background": True}', S)[0]["run_in_background"], True)

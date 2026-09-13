@@ -39,7 +39,20 @@ OpenAI-compatible API, including streaming and tool calls. Malformed tool-call J
 are surfaced as text instead of breaking the turn. Your key is stored in `~/.nvclaude.json`
 (owner-only permissions). Nothing else on your Claude Code setup is changed; run plain `claude` to go back to Anthropic.
 
-Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_MAX_TOKENS` (default 32768), `NVCLAUDE_DEBUG=1`.
+Reasoning effort picked in `/model` is sent as `reasoning_effort`; JSON-schema outputs become `response_format`. When a model
+rejects a parameter or a tool schema, the proxy retries with it dropped or simplified and remembers that for the session.
+
+Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_MAX_TOKENS` (default 32768), `NVCLAUDE_PING_SECS` (default 15), `NVCLAUDE_DEBUG=1`
+(request/latency log), `NVCLAUDE_DUMP=<file>` (append every raw Anthropic request, for debugging).
+
+## What the launcher sets
+
+Routing (always forced): `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY=` (empty), `ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`.
+
+Toggles (only if you haven't set them yourself): `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (NVIDIA models in `/model`),
+`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
+`CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`, `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`.
 
 ## Uninstall
 

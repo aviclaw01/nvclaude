@@ -27,6 +27,15 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_POST(self):
         req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        LAST["n"] = LAST.get("n", 0) + 1
+        def bad(msg):
+            b = json.dumps({"error": {"message": msg, "type": "invalid_request_error"}}).encode()
+            self.send_response(400); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+        m = req.get("model", "")
+        if m == "fail/reasoning_effort" and "reasoning_effort" in req: return bad("Unsupported parameter: 'reasoning_effort' is not supported with this model.")
+        if m == "fail/response_format" and req.get("response_format", {}).get("type") == "json_schema": return bad("response_format of type json_schema is not supported")
+        if m == "fail/schema" and "$ref" in json.dumps(req.get("tools", [])): return bad("Invalid schema for function 'Lookup': $ref is not supported in parameters")
+        if m == "fail/schema-hard" and any(t["function"]["parameters"].get("properties") for t in req.get("tools", [])): return bad("tool parameters schema not supported")
         if req.get("model") == "fail/504":
             b=b"upstream timed out"; self.send_response(504); self.send_header("Content-Type","text/plain"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
         if req.get("model") == "slow/2s": time.sleep(2)

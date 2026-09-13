@@ -47,6 +47,48 @@ def http(url, method="GET", body=None, headers=None, timeout=60):
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     return urllib.request.urlopen(req, timeout=timeout)
 
+def validate_api_key(key):
+    """Validate an NVIDIA key before it is persisted.
+
+    Network failures are allowed so the first run can still be completed
+    offline; an explicit authentication failure always rejects the key.
+    """
+    if not key.startswith("nvapi-") or len(key) <= len("nvapi-"):
+        return False
+    try:
+        response = http(
+            UPSTREAM + "/models",
+            headers={"Authorization": "Bearer " + key},
+            timeout=10,
+        )
+        response.read()
+        return True
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            print("key rejected by NVIDIA", file=sys.stderr)
+            return False
+        print("warning: NVIDIA key check returned HTTP %s; continuing" % exc.code,
+              file=sys.stderr)
+        return True
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print("warning: could not verify NVIDIA key (%s); saving for offline use" % exc,
+              file=sys.stderr)
+        return True
+
+def prompt_for_key():
+    import getpass
+    print("Get a free key at https://build.nvidia.com/settings/api-keys")
+    for attempt in range(3):
+        key = getpass.getpass("NVIDIA API key (nvapi-...): ").strip()
+        if validate_api_key(key):
+            print("validated key nvapi-…%s" % key[-4:])
+            return key
+        if key and key.startswith("nvapi-"):
+            print("Please enter a valid NVIDIA API key.", file=sys.stderr)
+        else:
+            print("Key must start with nvapi-.", file=sys.stderr)
+    die("could not validate NVIDIA API key after 3 attempts; get one at https://build.nvidia.com/settings/api-keys")
+
 def catalog():
     """Chat-capable models on build.nvidia.com (public endpoint, no key needed)."""
     data = json.load(http(UPSTREAM + "/models", timeout=20))["data"]
@@ -268,9 +310,7 @@ def main():
 
     key = os.environ.get("NVIDIA_API_KEY") or ("" if a.reset_key else cfg.get("api_key", ""))
     if not key:
-        import getpass
-        print("Get a free key at https://build.nvidia.com/settings/api-keys")
-        key = getpass.getpass("NVIDIA API key (nvapi-...): ").strip() or die("no key")
+        key = prompt_for_key()
         cfg["api_key"] = key; save_cfg(cfg)
     STATE["api_key"] = key
 

@@ -29,6 +29,9 @@ CONFIG = os.path.join(os.path.expanduser("~"), ".nvclaude.json")
 PREFIX = "nvclaude/"          # exposed model ids must contain "claude" for Claude Code's /model discovery
 SKIP = re.compile(r"embed|rerank|reward|safety|guard|ocr|parse|whisper|parakeet|riva|-vl-|vision|fuyu|paligemma|neva|kosmos|florence|clip", re.I)
 STATE = {"api_key": "", "model": ""}
+CATALOG_TTL = 24 * 60 * 60
+_catalog_lock = threading.Lock()
+_catalog_refreshing = False
 
 # ----------------------------------------------------------------------------- helpers
 def log(*a): print("\033[1;32m==>\033[0m", *a, flush=True)
@@ -68,12 +71,69 @@ def check_key(k):
     except Exception as e:
         return True, "could not reach NVIDIA (%s); continuing" % e
 
-def catalog():
-    """Chat-capable models on build.nvidia.com (public endpoint, no key needed)."""
+def _fetch_catalog():
+    """Fetch and filter chat-capable models from build.nvidia.com."""
     data = json.load(http(UPSTREAM + "/models", timeout=20))["data"]
     ids = sorted(m["id"] for m in data if not SKIP.search(m["id"]))
     ids.sort(key=lambda i: (0 if "nemotron" in i else 1, i))   # NVIDIA's own models first
     return ids
+
+
+def _read_catalog_cache():
+    cfg = load_cfg()
+    ids, fetched_at = cfg.get("catalog"), cfg.get("fetched_at")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids): return None
+    if not isinstance(fetched_at, (int, float)): return None
+    return ids, fetched_at
+
+
+def _save_catalog_cache(ids):
+    with _catalog_lock:
+        cfg = load_cfg()
+        cfg["catalog"], cfg["fetched_at"] = ids, time.time()
+        save_cfg(cfg)
+
+
+def _refresh_catalog():
+    global _catalog_refreshing
+    try:
+        _save_catalog_cache(_fetch_catalog())
+    except Exception as e:
+        log("catalog refresh failed; keeping the cached catalog: %s" % e)
+    finally:
+        with _catalog_lock: _catalog_refreshing = False
+
+
+def _start_catalog_refresh():
+    global _catalog_refreshing
+    with _catalog_lock:
+        if _catalog_refreshing: return
+        _catalog_refreshing = True
+    threading.Thread(target=_refresh_catalog, daemon=True).start()
+
+
+def catalog(force_refresh=False):
+    """Chat-capable models, using a 24-hour cache when possible.
+
+    A stale cache is returned immediately while one background refresh runs. A
+    forced refresh waits for the network and falls back to any cached catalog
+    if the endpoint is unavailable.
+    """
+    cached = _read_catalog_cache()
+    if cached and not force_refresh and time.time() - cached[1] < CATALOG_TTL:
+        return cached[0]
+    if cached and not force_refresh:
+        _start_catalog_refresh()
+        return cached[0]
+    try:
+        ids = _fetch_catalog()
+        _save_catalog_cache(ids)
+        return ids
+    except Exception as e:
+        if cached:
+            log("catalog refresh failed; using the cached catalog: %s" % e)
+            return cached[0]
+        raise
 
 def free_port(start):
     for p in range(start, start + 50):
@@ -443,13 +503,16 @@ def main():
     claude_args = []
     if "--" in argv: i = argv.index("--"); argv, claude_args = argv[:i], argv[i + 1:]
     cmd = argv[0] if argv else ""
-    a = argparse.Namespace(list=cmd == "list", pick=cmd == "pick", serve_only=cmd == "serve", reset_key=cmd == "key",
+    a = argparse.Namespace(list=cmd == "list", refresh=cmd == "refresh", pick=cmd == "pick", serve_only=cmd == "serve", reset_key=cmd == "key",
                            model=SHORT.get(cmd) or (cmd if "/" in cmd else None),
                            port=int(os.environ.get("NVCLAUDE_PORT", 8787)), claude_args=claude_args)
-    if cmd and not (a.list or a.pick or a.serve_only or a.reset_key or a.model):
-        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list | key | serve" % cmd)
+    if cmd and not (a.list or a.refresh or a.pick or a.serve_only or a.reset_key or a.model):
+        die("unknown command '%s'. Try: nvclaude | pick | nano | super | ultra | list [--refresh] | refresh | key | serve" % cmd)
     cfg = load_cfg()
-    if a.list: print("\n".join(catalog())); return
+    if a.list:
+        print("\n".join(catalog(force_refresh="--refresh" in argv[1:]))); return
+    if a.refresh:
+        print("\n".join(catalog(force_refresh=True))); return
 
     key = clean_key(os.environ.get("NVIDIA_API_KEY") or ("" if a.reset_key else cfg.get("api_key", "")))
     if key and key != cfg.get("api_key") and not os.environ.get("NVIDIA_API_KEY"):

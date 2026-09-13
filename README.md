@@ -25,7 +25,8 @@ The installer puts `nvclaude` on your PATH, installs Claude Code if missing, ask
 nvclaude              launch Claude Code on your last model
 nvclaude pick         choose a model from the full catalog (type to filter)
 nvclaude ultra        Nemotron 3 Ultra   (also: nano | super | lightning)
-nvclaude list         print the catalog
+nvclaude list         print the catalog (--refresh bypasses the 24h cache)
+nvclaude bench [m…]   measure first-token latency, streaming, tool calling; results show as badges in pick/list
 nvclaude info [model] context window, output cap, vision
 nvclaude key          change the API key
 nvclaude serve        proxy only, for VS Code or other clients (prints the token to use as ANTHROPIC_AUTH_TOKEN)
@@ -47,6 +48,10 @@ placeholder instead. Claude Code is told each model's real context window so aut
 (`nvclaude info <model>` shows it). Reasoning models' thinking is shown as Claude Code thinking blocks (set `NVCLAUDE_SHOW_THINKING=0` to hide it).
 Reasoning effort picked in `/model` is sent as `reasoning_effort`; JSON-schema outputs become `response_format`. When a model
 rejects a parameter or a tool schema, the proxy retries with it dropped or simplified and remembers that for the session.
+
+The catalog is cached for 24 hours (and served from cache while it refreshes). Models that answer "not found for this
+account" are hidden automatically. A mistyped model id gets close-match suggestions. Models known to be too slow on the
+free tier (DeepSeek V4 Pro) are flagged in the picker and at launch.
 
 The proxy only accepts requests carrying a per-session token, so other processes on the machine cannot spend your key;
 running `nvclaude` twice reuses the proxy that is already up.

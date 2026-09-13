@@ -45,3 +45,9 @@ Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_MAX_TOKENS` (default 32768), `NVCLAUDE_DEB
 rm ~/.local/bin/nvclaude ~/.nvclaude.json          # macOS / Linux
 Remove-Item -Recurse $env:LOCALAPPDATA\nvclaude; Remove-Item ~\.nvclaude.json   # Windows
 ```
+
+## Tests
+
+```
+python3 -m unittest discover -s tests -v
+```

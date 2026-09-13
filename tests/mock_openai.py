@@ -1,6 +1,25 @@
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LAST = {}
+# Malformed tool-argument variants, selected by an "ARGS:<key>" marker in the last user message.
+VARIANTS = {
+    "good": '{"command": "echo hi"}',
+    "trailing": '{"command": "echo hi",}',
+    "single": "{'command': 'echo hi'}",
+    "trunc_key": '{"command": "echo hi", "timeout"',
+    "trunc_str": '{"command": "echo h',
+    "bare": 'echo hi',
+    "dup": '{"command": "echo hi"}{"command": "echo hi"}',
+    "fence": '```json\n{"command": "echo hi"}\n```',
+    "wrapped": '{"name": "bash", "arguments": {"command": "echo hi"}}',
+    "garbage": 'this is not json }{',
+}
+def variant(req):
+    import re
+    m = re.search(r"ARGS:(\w+)", json.dumps(req["messages"]))
+    return VARIANTS[m.group(1)] if m else None
+def chunks(s, n=3):
+    k = max(1, len(s) // n); return [s[i:i + k] for i in range(0, len(s), k)]
 class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def do_GET(self):
@@ -8,11 +27,15 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_POST(self):
         req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if req.get("model") == "fail/400-truncated":   # issue #17: 400 whose chunked body is cut off
+            self.send_response(400); self.send_header("Content-Type","application/json"); self.send_header("Transfer-Encoding","chunked"); self.end_headers()
+            self.wfile.flush(); self.close_connection = True; self.wfile.write(b""); return
         LAST["req"] = req
         want_tool = bool(req.get("tools")) and "TOOLTEST" in json.dumps(req["messages"])
         if not req.get("stream"):
             msg={"role":"assistant","content":"Hello from mock."}
-            if want_tool: msg["tool_calls"]=[{"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo hi\"}"}}]
+            v = variant(req)
+            if want_tool or v: msg["tool_calls"]=[{"id":"call_1","type":"function","function":{"name":"Bash","arguments": v or "{\"command\":\"echo hi\"}"}}]
             b=json.dumps({"id":"chatcmpl-1","choices":[{"message":msg,"finish_reason":"tool_calls" if want_tool else "stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}).encode()
             self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
         self.send_response(200); self.send_header("Content-Type","text/event-stream"); self.send_header("Transfer-Encoding","chunked"); self.end_headers()
@@ -20,7 +43,13 @@ class H(BaseHTTPRequestHandler):
             c=("data: "+json.dumps(o)+"\n\n").encode(); self.wfile.write(b"%x\r\n%s\r\n"%(len(c),c)); self.wfile.flush()
         send({"choices":[{"delta":{"reasoning_content":"thinking..."}}]})
         for w in ["Hello"," from"," mock."]: send({"choices":[{"delta":{"content":w}}]})
-        if want_tool:
+        v = variant(req)
+        if v is not None:
+            name = "bash" if "wrapped" in json.dumps(req["messages"]) else "Bash"   # wrong-case name for the wrapped variant
+            send({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":name,"arguments":""}}]}}]})
+            for part in chunks(v): send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":part}}]}}]})
+            send({"choices":[{"delta":{},"finish_reason":"length" if "trunc" in v or v.startswith("{\"command\": \"echo h") else "tool_calls"}]})
+        elif want_tool:
             send({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]}}]})
             send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]})
             send({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]})

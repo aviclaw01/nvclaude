@@ -34,7 +34,9 @@ Inside Claude Code, `/model` also lists every NVIDIA model.
 ## How it works
 
 A local proxy (127.0.0.1:8787) translates Claude Code's Anthropic Messages API into NVIDIA's
-OpenAI-compatible API, including streaming and tool calls. Your key is stored in `~/.nvclaude.json`
+OpenAI-compatible API, including streaming and tool calls. Malformed tool-call JSON from weaker models
+(trailing commas, single quotes, fences, truncation, wrappers) is repaired before Claude Code sees it; unrepairable calls
+are surfaced as text instead of breaking the turn. Your key is stored in `~/.nvclaude.json`
 (owner-only permissions). Nothing else on your Claude Code setup is changed; run plain `claude` to go back to Anthropic.
 
 Env knobs: `NVCLAUDE_PORT`, `NVCLAUDE_MAX_TOKENS` (default 32768), `NVCLAUDE_DEBUG=1`.

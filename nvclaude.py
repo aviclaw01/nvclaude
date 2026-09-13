@@ -116,9 +116,115 @@ def to_openai(req):
 
 STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "content_filter": "end_turn"}
 
+def _read_err(e):
+    """Read an HTTPError body defensively: NVIDIA sometimes closes a chunked error body early (IncompleteRead)."""
+    try: msg = e.read().decode(errors="replace")
+    except Exception as ex:
+        msg = getattr(ex, "partial", b"").decode(errors="replace") if hasattr(ex, "partial") else ""
+    msg = (msg or "").strip() or ("HTTP %s %s (empty error body from upstream)" % (e.code, getattr(e, "reason", "")))
+    if os.environ.get("NVCLAUDE_DEBUG"): log("<- upstream %s: %s" % (e.code, msg[:1000]))
+    return msg[:4000]
+
 def usage_of(u):
     u = u or {}
     return {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}
+
+# ----------------------------------------------------------------------------- tool-call repair
+# Open models sometimes emit tool arguments that aren't valid JSON (trailing commas, single quotes,
+# Python literals, markdown fences, truncation at max_tokens, duplicated objects, a bare value, or a
+# Hermes-style {"name":..,"arguments":..} wrapper). Claude Code needs a clean dict, so we repair here.
+_FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
+_TRAIL = re.compile(r",\s*([}\]])")
+_PYLIT = [(re.compile(r"(?<![\w\"'])True(?![\w\"'])"), "true"), (re.compile(r"(?<![\w\"'])False(?![\w\"'])"), "false"),
+          (re.compile(r"(?<![\w\"'])None(?![\w\"'])"), "null")]
+
+def _scan(s):
+    """Walk s string-aware; return (first balanced {...} or None, list of unclosed closers, in_string_at_end)."""
+    start, depth, stack, in_str, esc, first = s.find("{"), 0, [], False, False, None
+    for i, c in enumerate(s):
+        if in_str:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': in_str = False
+        elif c == '"': in_str = True
+        elif c in "{[": stack.append("}" if c == "{" else "]")
+        elif c in "}]" and stack:
+            stack.pop()
+            if first is None and start >= 0 and i > start and not stack: first = s[start:i + 1]
+    return first, stack, in_str
+
+def _try(s):
+    try: return json.loads(s)
+    except Exception: return None
+
+def _close(s):
+    """Close an unterminated JSON prefix (output cut at max_tokens); drop a dangling partial token first."""
+    for _ in range(6):
+        _, stack, in_str = _scan(s)
+        if in_str: return None                 # cut inside a string value: refuse to guess the rest
+        v = _try(s + "".join(reversed(stack)))
+        if v is not None: return v
+        cut = max(s.rfind(","), s.rfind("{"), s.rfind("["))       # drop the trailing partial key/value
+        if cut <= 0: return None
+        s = s[:cut] if s[cut] == "," else s[:cut + 1]
+    return None
+
+def repair_args(raw, schema=None):
+    """Parse a tool-call arguments string leniently. Returns (dict, how) or (None, reason)."""
+    schema = schema or {}
+    props = list((schema.get("properties") or {}).keys())
+    raw = (raw or "").strip()
+    if not raw: return {}, "empty"
+    steps, s = [], raw
+    v = _try(s)
+    if v is None:
+        t = _FENCE.sub("", s).strip()
+        if t != s: s = t; steps.append("fence")
+        first, _, _ = _scan(s)
+        if first and first != s: s = first; steps.append("first-object")
+        v = _try(s)
+    if v is None:
+        t = _TRAIL.sub(r"\1", s)
+        for rx, rep in _PYLIT: t = rx.sub(rep, t)
+        if t != s: s = t; steps.append("literals")
+        v = _try(s)
+    if v is None and "'" in s and s.count('"') < 2:
+        t = s.replace("'", '"'); v = _try(t)
+        if v is not None: s = t; steps.append("single-quotes")
+    if v is None:
+        v = _close(s)
+        if v is not None: steps.append("truncated")
+    ptype = (schema.get("properties") or {}).get(props[0], {}).get("type") if len(props) == 1 else None
+    def bare_ok(val): return len(props) == 1 and (ptype is None or {"string": str, "number": (int, float), "integer": int,
+                                                     "boolean": bool, "array": list, "object": dict}.get(ptype, object) is not None
+                                                     and isinstance(val, {"string": str, "number": (int, float), "integer": int, "boolean": bool, "array": list, "object": dict}.get(ptype, object)))
+    if v is None and not re.search(r"[{}\[\]]", raw) and bare_ok(raw):
+        v = {props[0]: raw}; steps.append("bare-value")
+    if v is None: return None, "unparseable"
+    if isinstance(v, dict) and "arguments" in v and set(v) <= {"name", "arguments", "id", "type"} and isinstance(v["arguments"], (dict, str)):
+        inner = v["arguments"]; v = inner if isinstance(inner, dict) else (_try(inner) or repair_args(inner, schema)[0]); steps.append("unwrapped")
+    if isinstance(v, dict) and "parameters" in v and set(v) <= {"name", "parameters"} and isinstance(v["parameters"], dict):
+        v = v["parameters"]; steps.append("unwrapped")
+    if not isinstance(v, dict):
+        if bare_ok(v): v = {props[0]: v}; steps.append("bare-value")
+        else: return None, "not-an-object"
+    return v, ",".join(steps) or "ok"
+
+def tool_blocks(calls, schemas):
+    """calls: [{"id","name","args"}] in order -> (content blocks, number of valid tool_use blocks)."""
+    blocks, ok = [], 0
+    names = {n.lower(): n for n in schemas}
+    for c in calls:
+        name = c.get("name") or ""
+        if name not in schemas and name.lower() in names: name = names[name.lower()]     # fix casing
+        args, how = repair_args(c.get("args") or "", schemas.get(name))
+        if args is None or not name:
+            blocks.append({"type": "text", "text": "\n[nvclaude] The model produced a malformed tool call%s that could not be repaired (%s):\n```\n%s\n```\n"
+                           % (" to `%s`" % name if name else "", how, (c.get("args") or "")[:2000])})
+            continue
+        if how != "ok" and os.environ.get("NVCLAUDE_DEBUG"): log("repaired tool call to %s via %s" % (name, how))
+        blocks.append({"type": "tool_use", "id": c.get("id") or "toolu_%x" % time.time_ns(), "name": name, "input": args}); ok += 1
+    return blocks, ok
 
 # ----------------------------------------------------------------------------- proxy
 class Handler(BaseHTTPRequestHandler):
@@ -145,6 +251,19 @@ class Handler(BaseHTTPRequestHandler):
         self._err(404, "not found")
 
     def do_POST(self):
+        try: self._post()
+        except (BrokenPipeError, ConnectionResetError): pass
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            try: self._err(500, "nvclaude proxy error: %r" % e)
+            except Exception: pass
+
+    def _upstream(self, body, hdr):
+        if os.environ.get("NVCLAUDE_DEBUG"):
+            o = json.loads(body); log("-> %s max_tokens=%s tools=%d stream=%s" % (o["model"], o.get("max_tokens"), len(o.get("tools", [])), o.get("stream")))
+        return http(UPSTREAM + "/chat/completions", "POST", body, hdr, timeout=600)
+
+    def _post(self):
         n = int(self.headers.get("Content-Length") or 0)
         try: req = json.loads(self.rfile.read(n) or b"{}")
         except Exception: return self._err(400, "bad json")
@@ -154,31 +273,32 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/v1/messages": return self._err(404, "not found")
         body = json.dumps(to_openai(req)).encode()
         hdr = {"Content-Type": "application/json", "Authorization": "Bearer " + STATE["api_key"], "Accept": "text/event-stream"}
-        try: up = http(UPSTREAM + "/chat/completions", "POST", body, hdr, timeout=600)
+        try: up = self._upstream(body, hdr)
         except urllib.error.HTTPError as e:
-            msg = e.read().decode(errors="replace")[:4000]
+            msg = _read_err(e)
             if e.code == 400 and "stream_options" in msg:      # some models reject it; retry without
                 o = json.loads(body); o.pop("stream_options", None)
-                try: up = http(UPSTREAM + "/chat/completions", "POST", json.dumps(o).encode(), hdr, timeout=600)
-                except urllib.error.HTTPError as e2: return self._err(e2.code, e2.read().decode(errors="replace")[:4000])
+                try: up = self._upstream(json.dumps(o).encode(), hdr)
+                except urllib.error.HTTPError as e2: return self._err(e2.code, _read_err(e2))
+                except Exception as e2: return self._err(502, "upstream: %s" % e2)
             else: return self._err(e.code, msg)
         except Exception as e: return self._err(502, "upstream: %s" % e)
-        if req.get("stream"): self._stream(up, req)
-        else: self._once(up, req)
+        schemas = {t["name"]: t.get("input_schema") or {} for t in req.get("tools", []) if t.get("name")}
+        if req.get("stream"): self._stream(up, req, schemas)
+        else: self._once(up, req, schemas)
 
-    def _once(self, up, req):
+    def _once(self, up, req, schemas):
         r = json.load(up); ch = (r.get("choices") or [{}])[0]; m = ch.get("message", {})
         content = []
         if m.get("content"): content.append({"type": "text", "text": m["content"]})
-        for tc in m.get("tool_calls") or []:
-            try: args = json.loads(tc["function"].get("arguments") or "{}")
-            except Exception: args = {"_raw": tc["function"].get("arguments")}
-            content.append({"type": "tool_use", "id": tc.get("id") or "toolu_%x" % time.time_ns(), "name": tc["function"]["name"], "input": args})
+        calls = [{"id": tc.get("id"), "name": (tc.get("function") or {}).get("name"), "args": (tc.get("function") or {}).get("arguments")}
+                 for tc in m.get("tool_calls") or []]
+        blocks, ok = tool_blocks(calls, schemas); content += blocks
+        stop = "tool_use" if ok else ("end_turn" if calls else STOP.get(ch.get("finish_reason"), "end_turn"))
         self._json(200, {"id": r.get("id", "msg_1"), "type": "message", "role": "assistant", "model": req.get("model"),
-                         "content": content, "stop_reason": STOP.get(ch.get("finish_reason"), "end_turn"),
-                         "stop_sequence": None, "usage": usage_of(r.get("usage"))})
+                         "content": content, "stop_reason": stop, "stop_sequence": None, "usage": usage_of(r.get("usage"))})
 
-    def _stream(self, up, req):
+    def _stream(self, up, req, schemas):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
         def ev(t, d):
@@ -186,10 +306,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk)); self.wfile.flush()
         ev("message_start", {"type": "message_start", "message": {"id": "msg_%x" % time.time_ns(), "type": "message", "role": "assistant",
             "model": req.get("model"), "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
-        idx, open_kind, tools, usage, finish, last_ping = -1, None, {}, None, None, time.time()
-        def close():
-            nonlocal open_kind
-            if open_kind is not None: ev("content_block_stop", {"type": "content_block_stop", "index": idx}); open_kind = None
+        idx, text_open, calls, usage, finish, last_ping = -1, False, {}, None, None, time.time()
+        # Text streams live. Tool calls are buffered until the stream ends so their arguments can be
+        # validated/repaired as a whole (Claude Code only runs tools after the message completes anyway).
+        def close_text():
+            nonlocal text_open
+            if text_open: ev("content_block_stop", {"type": "content_block_stop", "index": idx}); text_open = False
         try:
             for raw in up:
                 line = raw.decode(errors="replace").strip()
@@ -205,20 +327,30 @@ class Handler(BaseHTTPRequestHandler):
                     if d.get("reasoning_content") or d.get("reasoning"):
                         if time.time() - last_ping > 5: ev("ping", {"type": "ping"}); last_ping = time.time()
                     if d.get("content"):
-                        if open_kind != "text":
-                            close(); idx += 1; open_kind = "text"
+                        if not text_open:
+                            idx += 1; text_open = True
                             ev("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
                         ev("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": d["content"]}})
                     for tc in d.get("tool_calls") or []:
                         i = tc.get("index", 0); fn = tc.get("function") or {}
-                        if i not in tools:
-                            close(); idx += 1; open_kind = "tool"; tools[i] = idx
-                            ev("content_block_start", {"type": "content_block_start", "index": idx, "content_block":
-                                {"type": "tool_use", "id": tc.get("id") or "toolu_%x" % time.time_ns(), "name": fn.get("name") or "", "input": {}}})
-                        if fn.get("arguments"):
-                            ev("content_block_delta", {"type": "content_block_delta", "index": tools[i], "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}})
-            close()
-            ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": STOP.get(finish, "end_turn"), "stop_sequence": None}, "usage": usage_of(usage)})
+                        c = calls.setdefault(i, {"id": None, "name": "", "args": ""})
+                        if tc.get("id"): c["id"] = tc["id"]
+                        if fn.get("name") and not c["name"]: c["name"] = fn["name"]
+                        if fn.get("arguments"): c["args"] += fn["arguments"]
+                        if time.time() - last_ping > 5: ev("ping", {"type": "ping"}); last_ping = time.time()
+            close_text()
+            blocks, ok = tool_blocks([calls[i] for i in sorted(calls)], schemas)
+            for b in blocks:
+                idx += 1
+                if b["type"] == "text":
+                    ev("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
+                    ev("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": b["text"]}})
+                else:
+                    ev("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": b["id"], "name": b["name"], "input": {}}})
+                    ev("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}})
+                ev("content_block_stop", {"type": "content_block_stop", "index": idx})
+            stop = "tool_use" if ok else ("end_turn" if calls else STOP.get(finish, "end_turn"))
+            ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": usage_of(usage)})
             ev("message_stop", {"type": "message_stop"})
             self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError): pass

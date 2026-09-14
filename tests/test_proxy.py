@@ -278,6 +278,20 @@ class ProxyTests(unittest.TestCase):
         self.assertTrue(json.load(urllib.request.urlopen(PROXY + "/nvclaude", timeout=5))["nvclaude"])                             # identity probe
         self.assertEqual(post("/v1/messages/count_tokens", {"messages": []}, token=TOKEN)["input_tokens"] >= 1, True)
 
+    def test_launch_never_borrows_another_sessions_proxy(self):     # regression: stale/foreign proxy -> connection refused
+        old = nv.RUNFILE
+        try:
+            nv.RUNFILE = os.path.join(self.tmp, "run-own.json")
+            json.dump({"pid": 999999999, "port": 8797, "token": "foreign", "model": "m"}, open(nv.RUNFILE, "w"))   # dead pid, live port (our test proxy)
+            saved = nv.STATE["token"]
+            p, token, srv = nv.ensure_proxy(8797, False)
+            try:
+                self.assertNotEqual(p, 8797)                       # port busy -> own proxy on another port
+                self.assertNotEqual(token, "foreign"); self.assertIsNotNone(srv)
+                self.assertEqual(json.load(open(nv.RUNFILE))["pid"], os.getpid())     # stale file replaced by ours
+            finally: nv.stop(srv); nv.STATE["token"] = saved
+        finally: nv.RUNFILE = old
+
     def test_running_instance_detection(self):
         import tempfile
         old = nv.RUNFILE

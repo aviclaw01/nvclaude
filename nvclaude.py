@@ -32,7 +32,7 @@ Config lives in ~/.nvclaude.json (chmod 600).
 import argparse, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 SELF_URL = os.environ.get("NVCLAUDE_SRC", "https://raw.githubusercontent.com/aviclaw01/nvclaude/main/nvclaude.py")
 UPSTREAM = os.environ.get("NVCLAUDE_UPSTREAM", "https://integrate.api.nvidia.com/v1")
 CONFIG = os.path.join(os.path.expanduser("~"), ".nvclaude.json")
@@ -847,14 +847,20 @@ def set_tier(cfg, slot, value):
 def tiers(cfg, model):
     return cfg.get("model_fast") or FAST_DEFAULT, cfg.get("model_subagent") or model
 
+def pid_alive(pid):
+    try: os.kill(int(pid), 0); return True
+    except Exception: return False
+
 def ensure_proxy(port, serve_only):
-    """Step 3: reuse a running proxy or start one. Returns (port, token, srv-or-None)."""
-    running = None if serve_only else running_instance(port)
-    if running:
-        log("Reusing the nvclaude proxy already running on :%d (pid %s)" % (running["port"], running.get("pid")))
-        return running["port"], running["token"], None
+    """Step 3: start this session's own proxy. A proxy lives and dies with the nvclaude process that started it, so a
+    launch never borrows another session's (that left Claude Code talking to a closed port when the other session ended).
+    Two nvclaude sessions simply get two proxies on two ports. Returns (port, token, srv)."""
+    try:
+        run = json.load(open(RUNFILE))
+        if not pid_alive(run.get("pid", -1)): os.remove(RUNFILE)          # stale run file from a session that was killed
+    except Exception: pass
     p = free_port(port)
-    if p != port: log("Port %d is busy (not nvclaude); using :%d instead" % (port, p))
+    if p != port: log("Port %d is busy; using :%d for this session" % (port, p))
     srv = serve(p, os.environ.get("NVCLAUDE_TOKEN") or None, write_runfile=True)
     return p, STATE["token"], srv
 
@@ -863,6 +869,7 @@ def cmd_status(cfg, port):
     model = cfg.get("model", ""); fast, sub = tiers(cfg, model or "(main model)")
     cat = cfg.get("catalog") or {}
     run = running_instance(port)
+    if run and not pid_alive(run.get("pid", -1)): run = None
     rows = [("NVIDIA key", mask(key) + ("" if not key or KEY_RE.fullmatch(key) else "  (INVALID format)") + ("  (from NVIDIA_API_KEY env)" if os.environ.get("NVIDIA_API_KEY") else "")),
             ("model", (model + ("  [" + badge(model, cfg) + "]" if badge(model, cfg) else "")) if model else "not chosen  -> nvclaude pick"),
             ("fast tier (Haiku)", fast + ("" if cfg.get("model_fast") else "  (default)")),
@@ -934,8 +941,7 @@ def main():
     log("Claude Code on %s  (fast tier: %s%s; proxy :%d). Switch with /model or `nvclaude pick`." % (model, fast, "" if sub == model else "; subagents: " + sub, p))
     try: rc = subprocess.call([claude] + claude_args, env=env)
     except KeyboardInterrupt: rc = 130
-    finally:
-        if srv is not None: stop(srv)
+    finally: stop(srv)
     sys.exit(rc)
 
 if __name__ == "__main__":
